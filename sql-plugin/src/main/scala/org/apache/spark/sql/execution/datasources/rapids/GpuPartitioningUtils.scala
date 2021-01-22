@@ -23,15 +23,19 @@ import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeUtils}
 import org.apache.spark.sql.execution.datasources.{PartitioningUtils, PartitionSpec}
 import org.apache.spark.sql.types.StructType
 
+
 object GpuPartitioningUtils {
 
   /**
    * Mainly derived from PartitioningAwareFileIndex.inferPartitioning
    * @param sparkSession
    * @param leafDirs leaf directory paths
-   * @param basePaths
-   * @param parameters
-   * @param userSpecifiedSchema
+   * @param basePaths Contains a set of paths that are considered as the base dirs of the
+   *                  input datasets. The partitioning discovery logic will make sure it
+   *                  will stop when it reaches any base path
+   * @param parameters a set of options to control partition discovery
+   * @param userSpecifiedSchema an optional user specified schema that will be use to provide
+   *                            types for the discovered partitions
    * @return
    */
   def inferPartitioning(
@@ -41,26 +45,23 @@ object GpuPartitioningUtils {
       parameters: Map[String, String],
       userSpecifiedSchema: Option[StructType]): PartitionSpec = {
 
-    val caseInsensitiveOptions = CaseInsensitiveMap(parameters)
-    val timeZoneId = caseInsensitiveOptions.get(DateTimeUtils.TIMEZONE_OPTION)
-      .getOrElse(sparkSession.sessionState.conf.sessionLocalTimeZone)
+    val recursiveFileLookup = parameters.getOrElse("recursiveFileLookup", "false").toBoolean
 
-    PartitioningUtils.parsePartitions(
-      leafDirs,
-      typeInference = sparkSession.sessionState.conf.partitionColumnTypeInferenceEnabled,
-      basePaths = basePaths,
-      userSpecifiedSchema = userSpecifiedSchema,
-      caseSensitive = sparkSession.sqlContext.conf.caseSensitiveAnalysis,
-      validatePartitionColumns = sparkSession.sqlContext.conf.validatePartitionColumns,
-      timeZoneId = timeZoneId)
+    if (recursiveFileLookup) {
+      PartitionSpec.emptySpec
+    } else {
+      val caseInsensitiveOptions = CaseInsensitiveMap(parameters)
+      val timeZoneId = caseInsensitiveOptions.get(DateTimeUtils.TIMEZONE_OPTION)
+        .getOrElse(sparkSession.sessionState.conf.sessionLocalTimeZone)
+
+      PartitioningUtils.parsePartitions(
+        leafDirs,
+        typeInference = sparkSession.sessionState.conf.partitionColumnTypeInferenceEnabled,
+        basePaths = basePaths,
+        userSpecifiedSchema = userSpecifiedSchema,
+        caseSensitive = sparkSession.sqlContext.conf.caseSensitiveAnalysis,
+        validatePartitionColumns = sparkSession.sqlContext.conf.validatePartitionColumns,
+        timeZoneId = timeZoneId)
+    }
   }
 }
-/**
- *
- * @param sparkSession
- * @param inputFiles results from FileIndex.listFiles()
- * @param basePaths
- * @param parameters
- * @param userSpecifiedSchema
- * @return
- */

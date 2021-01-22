@@ -30,6 +30,7 @@ import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.adaptive.ShuffleQueryStageExec
 import org.apache.spark.sql.execution.datasources.{FileIndex, FilePartition, HadoopFsRelation, InMemoryFileIndex, PartitionDirectory, PartitionedFile}
+import org.apache.spark.sql.execution.datasources.PartitioningAwareFileIndex.BASE_PATH_PARAM
 import org.apache.spark.sql.execution.datasources.json.JsonFileFormat
 import org.apache.spark.sql.execution.datasources.rapids.GpuPartitioningUtils
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
@@ -40,8 +41,6 @@ import org.apache.spark.sql.rapids.GpuFileSourceScanExec
 import org.apache.spark.sql.rapids.execution.{GpuBroadcastExchangeExecBase, GpuBroadcastNestedLoopJoinExecBase, GpuShuffleExchangeExecBase}
 import org.apache.spark.sql.rapids.execution.python.GpuWindowInPandasExecMetaBase
 import org.apache.spark.sql.types._
-
-import scala.collection.mutable
 
 class Spark301dbShims extends Spark301Shims {
 
@@ -242,68 +241,92 @@ class Spark301dbShims extends Spark301Shims {
     queryStage.shuffle.asInstanceOf[GpuShuffleExchangeExecBase]
   }
 
-//  // this function is copied from Spark300Shims
-//  override def getLocationWithAlluxioReplace(
-//      conf: RapidsConf,
-//      relation: HadoopFsRelation,
-//      partitionFilters: Seq[Expression],
-//      dataFilters: Seq[Expression]): FileIndex = {
-//
-//    val alluxioFilesReplace: Option[Seq[String]] = conf.getAlluxioPathsToReplace
-//
-//    if (alluxioFilesReplace.isDefined) {
-//      // alluxioFilesReplace: Seq("key->value", "key1->value1")
-//      val replaceMap = new mutable.HashMap[String, String]()
-//      alluxioFilesReplace.get.foreach(rule => {
-//        val ruleSplit = rule.split("->")
-//        if (ruleSplit.size == 2) {
-//          replaceMap += ruleSplit(0).trim -> ruleSplit(1).trim
-//        } else {
-//          logWarning("Wrong set for spark.rapids.alluxio.pathsToReplace " + rule)
-//        }
-//      })
-//
-//      if (replaceMap.size > 0) {
-//        val listFiles: Seq[PartitionDirectory] = relation.location.listFiles(
-//          partitionFilters, dataFilters)
-//
-//        val replaceFunc = (f: Path) => {
-//          val matchedSet = replaceMap.keySet.filter(reg => f.toString.startsWith(reg))
-//          if (matchedSet.size > 0) {
-//            new Path(
-//              f.toString.replaceFirst(matchedSet.head, replaceMap(matchedSet.head)))
-//          } else {
-//            f
-//          }
-//        }
-//
-//        val inputFiles: Seq[Path] = listFiles.flatMap(partitionDir => {
-//          partitionDir.files.map(f => replaceFunc(f.getPath))
-//        }).toSet.toSeq
-//
-//        // get the leaf dir of inputFiles
-//        val leafDirs = inputFiles.map(_.getParent).toSet.toSeq
-//
-//        val finalRootPaths = relation.location.rootPaths.map(replaceFunc)
-//
-//        val partitionSpec = GpuPartitioningUtils.inferPartitioning(
-//          relation.sparkSession,
-//          leafDirs,
-//          finalRootPaths.toSet,
-//          relation.options,
-//          Option(relation.dataSchema))
-//
-//        new InMemoryFileIndex(
-//          relation.sparkSession,
-//          inputFiles,
-//          relation.options,
-//          Option(relation.dataSchema),
-//          userSpecifiedPartitionSpec = Some(partitionSpec))
-//      } else {
-//        relation.location
-//      }
-//    } else {
-//      relation.location
-//    }
-//  }
+  // This function is totally same with the one in Spark300Shims, which can't be directlly used in
+  // databricks env, since the exception will be thrown as below
+  // java.lang.ClassCastException: org.apache.spark.sql.execution.datasources.SerializableFileStatus
+  //  cannot be cast to org.apache.hadoop.fs.FileStatus
+  // So copy the function from Spark300Shims here
+  override def getLocationWithAlluxioReplace(
+      conf: RapidsConf,
+      relation: HadoopFsRelation,
+      partitionFilters: Seq[Expression],
+      dataFilters: Seq[Expression]): FileIndex = {
+
+    val alluxioPathsReplace: Option[Seq[String]] = conf.getAlluxioPathsToReplace
+
+    if (alluxioPathsReplace.isDefined) {
+      // alluxioPathsReplace: Seq("key->value", "key1->value1")
+      // turn the rules to the Map with eg
+      // { s3:/foo -> alluxio://0.1.2.3:19998/foo,
+      //   gs:/bar -> alluxio://0.1.2.3:19998/bar,
+      //   /baz -> alluxio://0.1.2.3:19998/baz }
+      val replaceMapOption = alluxioPathsReplace.map(rules => {
+        rules.map(rule => {
+          val split = rule.split("->")
+          if (split.size == 2) {
+            split(0).trim -> split(1).trim
+          } else {
+            throw new IllegalArgumentException(
+              "Wrong setting for spark.rapids.alluxio.pathsToReplace: " + rule)
+          }
+        }).toMap
+      })
+
+      replaceMapOption.map(replaceMap => {
+        val partitionDirs = relation.location.listFiles(partitionFilters, dataFilters)
+
+        // replacement func to check if the file path is prefixed with the string user configured
+        // if yes, replace it
+        val replaceFunc = (f: Path) => {
+          val pathStr = f.toString
+          val matchedSet = replaceMap.keySet.filter(reg => pathStr.startsWith(reg))
+          if (matchedSet.size > 0) {
+            new Path(pathStr.replaceFirst(matchedSet.head, replaceMap(matchedSet.head)))
+          } else {
+            f
+          }
+        }
+
+        // replace all of input files and unique
+        val inputFiles: Seq[Path] = partitionDirs.flatMap(partitionDir => {
+          partitionDir.files.map(f => replaceFunc(f.getPath))
+        }).toSet.toSeq
+
+        // get unique leaf dirs of inputFiles
+        val leafDirs = inputFiles.map(_.getParent).toSet.toSeq
+
+        // replace all of rootPaths which are already unique
+        val rootPaths = relation.location.rootPaths.map(replaceFunc)
+
+        val parameters: Map[String, String] = relation.options
+
+        val basePathOption = parameters.get(BASE_PATH_PARAM).map(file => {
+          replaceFunc(new Path(file))
+        })
+
+        val basePaths = getBasePaths(
+          relation.sparkSession.sessionState.newHadoopConfWithOptions(parameters),
+          basePathOption, rootPaths, inputFiles)
+
+        // infer to PartitionSpec
+        val partitionSpec = GpuPartitioningUtils.inferPartitioning(
+          relation.sparkSession,
+          leafDirs,
+          basePaths,
+          parameters,
+          Option(relation.dataSchema))
+
+        // generate a new InMemoryFileIndex holding paths with alluxio schema
+        new InMemoryFileIndex(
+          relation.sparkSession,
+          inputFiles,
+          parameters,
+          Option(relation.dataSchema),
+          userSpecifiedPartitionSpec = Some(partitionSpec))
+      }).getOrElse(relation.location)
+
+    } else {
+      relation.location
+    }
+  }
 }
