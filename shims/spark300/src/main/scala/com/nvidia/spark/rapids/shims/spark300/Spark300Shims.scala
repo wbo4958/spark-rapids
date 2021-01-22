@@ -17,6 +17,7 @@
 package com.nvidia.spark.rapids.shims.spark300
 
 import java.time.ZoneId
+import scala.collection.mutable
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.spark300.RapidsShuffleManager
 import org.apache.hadoop.fs.Path
@@ -35,7 +36,8 @@ import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.connector.read.Scan
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.adaptive.ShuffleQueryStageExec
-import org.apache.spark.sql.execution.datasources.{FileIndex, FilePartition, FileScanRDD, HadoopFsRelation, InMemoryFileIndex, PartitionDirectory, PartitionedFile, RapidsPartitioningUtils}
+import org.apache.spark.sql.execution.datasources.rapids.GpuPartitioningUtils
+import org.apache.spark.sql.execution.datasources.{FileIndex, FilePartition, FileScanRDD, HadoopFsRelation, InMemoryFileIndex, PartitionDirectory, PartitionedFile}
 import org.apache.spark.sql.execution.datasources.v2.orc.OrcScan
 import org.apache.spark.sql.execution.datasources.v2.parquet.ParquetScan
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ShuffleExchangeExec}
@@ -50,7 +52,7 @@ import org.apache.spark.sql.types._
 import org.apache.spark.storage.{BlockId, BlockManagerId}
 import org.apache.spark.unsafe.types.CalendarInterval
 
-import scala.collection.mutable
+
 
 class Spark300Shims extends SparkShims with Logging {
 
@@ -452,12 +454,13 @@ class Spark300Shims extends SparkShims with Logging {
       partitionFilters: Seq[Expression],
       dataFilters: Seq[Expression]): FileIndex = {
 
-    val alluxioFilesReplace: Option[Seq[String]] = conf.getAlluxioFilesReplace
+    val alluxioPathsReplace: Option[Seq[String]] = conf.getAlluxioPathsToReplace
 
-    if (alluxioFilesReplace.isDefined) {
-      // alluxioFilesReplace: Seq("key->value", "key1->value1")
+    if (alluxioPathsReplace.isDefined) {
+      // alluxioPathsReplace: Seq("key->value", "key1->value1")
       val replaceMap = new mutable.HashMap[String, String]()
-      alluxioFilesReplace.get.foreach(rule => {
+
+      alluxioPathsReplace.get.foreach(rule => {
         val ruleSplit = rule.split("->")
         if (ruleSplit.size == 2) {
           replaceMap += ruleSplit(0).trim -> ruleSplit(1).trim
@@ -467,14 +470,13 @@ class Spark300Shims extends SparkShims with Logging {
       })
 
       if (replaceMap.size > 0) {
-        val listFiles: Seq[PartitionDirectory] = relation.location.listFiles(
-          partitionFilters, dataFilters)
+        val listFiles = relation.location.listFiles(partitionFilters, dataFilters)
 
         val replaceFunc = (f: Path) => {
-          val matchedSet = replaceMap.keySet.filter(reg => f.toString.startsWith(reg))
+          val pathStr = f.toString
+          val matchedSet = replaceMap.keySet.filter(reg => pathStr.startsWith(reg))
           if (matchedSet.size > 0) {
-            new Path(
-              f.toString.replaceFirst(matchedSet.head, replaceMap(matchedSet.head)))
+            new Path(pathStr.replaceFirst(matchedSet.head, replaceMap(matchedSet.head)))
           } else {
             f
           }
@@ -484,15 +486,16 @@ class Spark300Shims extends SparkShims with Logging {
           partitionDir.files.map(f => replaceFunc(f.getPath))
         }).toSet.toSeq
 
-        // get the leaf dir of inputFiles
+        // get uniq leaf dirs of inputFiles
         val leafDirs = inputFiles.map(_.getParent).toSet.toSeq
 
-        val finalRootPaths = relation.location.rootPaths.map(replaceFunc)
+        // get the rootPaths of original location with schema replaced by alluxio
+        val rootPaths = relation.location.rootPaths.map(replaceFunc)
 
-        val partitionSpec = RapidsPartitioningUtils.inferPartitioning(
+        val partitionSpec = GpuPartitioningUtils.inferPartitioning(
           relation.sparkSession,
           leafDirs,
-          finalRootPaths.toSet,
+          rootPaths.toSet,
           relation.options,
           Option(relation.dataSchema))
 
