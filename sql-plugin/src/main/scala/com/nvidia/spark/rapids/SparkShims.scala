@@ -199,4 +199,8 @@ trait SparkShims {
     basePathOption: Option[Path],
     rootPaths: Seq[Path],
     leafFiles: Seq[Path]): Set[Path]
+
+  def replacePartitionDirectoryFiles(
+    partitionDir: PartitionDirectory,
+    replaceFunc: Path => Path): Seq[Path]
 }

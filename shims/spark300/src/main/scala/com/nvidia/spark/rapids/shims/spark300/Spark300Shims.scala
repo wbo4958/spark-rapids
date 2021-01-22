@@ -17,12 +17,10 @@
 package com.nvidia.spark.rapids.shims.spark300
 
 import java.time.ZoneId
-
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.spark300.RapidsShuffleManager
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
-
 import org.apache.spark.SparkEnv
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{SparkSession, SparkSessionExtensions}
@@ -493,7 +491,7 @@ class Spark300Shims extends SparkShims {
 
         // replace all of input files and unique
         val inputFiles: Seq[Path] = partitionDirs.flatMap(partitionDir => {
-          partitionDir.files.map(f => replaceFunc(f.getPath))
+          replacePartitionDirectoryFiles(partitionDir, replaceFunc)
         }).toSet.toSeq
 
         // get unique leaf dirs of inputFiles
@@ -583,5 +581,10 @@ class Spark300Shims extends SparkShims {
           val qualifiedPath = path.getFileSystem(hadoopConf).makeQualified(path)
           if (leafFiles.contains(qualifiedPath)) qualifiedPath.getParent else qualifiedPath }.toSet
     }
+  }
+
+  override def replacePartitionDirectoryFiles(partitionDir: PartitionDirectory,
+      replaceFunc: Path => Path): Seq[Path] = {
+    partitionDir.files.map(f => replaceFunc(f.getPath))
   }
 }
