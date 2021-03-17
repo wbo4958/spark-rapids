@@ -17,12 +17,9 @@
 package org.apache.spark.sql.rapids
 
 import java.util.concurrent.TimeUnit.NANOSECONDS
-
 import scala.collection.mutable.HashMap
-
-import com.nvidia.spark.rapids.{GpuDataSourceRDD, GpuExec, GpuMetric, GpuParquetMultiFilePartitionReaderFactory, GpuReadCSVFileFormat, GpuReadFileFormatWithMetrics, GpuReadOrcFileFormat, GpuReadParquetFileFormat, RapidsConf, ShimLoader, SparkPlanMeta}
+import com.nvidia.spark.rapids.{GpuDataSourceRDD, GpuExec, GpuMetric, GpuOrcMultiFilePartitionReaderFactory, GpuParquetMultiFilePartitionReaderFactory, GpuReadCSVFileFormat, GpuReadFileFormatWithMetrics, GpuReadOrcFileFormat, GpuReadParquetFileFormat, RapidsConf, ShimLoader, SparkPlanMeta}
 import org.apache.hadoop.fs.Path
-
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.{InternalRow, TableIdentifier}
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
@@ -32,6 +29,7 @@ import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partition
 import org.apache.spark.sql.execution.{ExecSubqueryExpression, ExplainUtils, FileSourceScanExec, SQLExecution}
 import org.apache.spark.sql.execution.datasources.{BucketingUtils, DataSourceStrategy, DataSourceUtils, FileFormat, FilePartition, HadoopFsRelation, PartitionDirectory, PartitionedFile}
 import org.apache.spark.sql.execution.datasources.csv.CSVFileFormat
+import org.apache.spark.sql.execution.datasources.orc.OrcFileFormat
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.execution.metric.SQLMetrics
 import org.apache.spark.sql.internal.SQLConf
@@ -502,6 +500,29 @@ case class GpuFileSourceScanExec(
 
     val partitions =
       FilePartition.getFilePartitions(relation.sparkSession, splitFiles, maxSplitBytes)
+
+    if (relation.fileFormat.isInstanceOf[OrcFileFormat]) {
+      // here we are making an optimization to read more then 1 file at a time on the CPU side
+      // if they are small files before sending it down to the GPU
+      val sqlConf = relation.sparkSession.sessionState.conf
+      val hadoopConf = relation.sparkSession.sessionState.newHadoopConfWithOptions(relation.options)
+      val broadcastedHadoopConf =
+        relation.sparkSession.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
+
+      val factory = GpuOrcMultiFilePartitionReaderFactory(
+        sqlConf,
+        broadcastedHadoopConf,
+        relation.dataSchema,
+        requiredSchema,
+        relation.partitionSchema,
+        pushedDownFilters.toArray,
+        rapidsConf,
+        allMetrics,
+        queryUsesInputFile)
+
+      // note we use the v2 DataSourceRDD instead of FileScanRDD so we don't have to copy more code
+      return new GpuDataSourceRDD(relation.sparkSession.sparkContext, partitions, factory)
+    }
 
     if (isPerFileReadEnabled) {
       logInfo("Using the original per file parquet reader")
