@@ -1,15 +1,13 @@
 package com.nvidia.spark.rapids
 
 import java.util.concurrent.{Callable, ConcurrentLinkedQueue, Future}
-
 import scala.collection.JavaConverters.collectionAsScalaIterableConverter
 import scala.collection.mutable.Queue
-
 import ai.rapids.cudf.{HostMemoryBuffer, NvtxColor, NvtxRange}
 import com.nvidia.spark.rapids.GpuMetric.PEAK_DEVICE_MEMORY
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.FileSystem
-
+import org.apache.orc.TypeDescription
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
@@ -44,7 +42,9 @@ case class HostMemoryBuffersForOrc(
   override val fileName: String,
   override val fileStart: Long,
   override val fileLength: Long,
-  override val bytesRead: Long
+  override val bytesRead: Long,
+  updatedReadSchema: TypeDescription,
+  requestedMapping: Option[Array[Int]]
 ) extends HostMemoryBuffersWithMetaDataBase
 
 abstract class MultiFileCloudPartitionReaderBase(
@@ -58,11 +58,13 @@ abstract class MultiFileCloudPartitionReaderBase(
 
   metrics = execMetrics
 
+  protected var maxDeviceMemory: Long = 0
+
   protected var batch: Option[ColumnarBatch] = None
   protected var isDone: Boolean = false
 
   private var filesToRead = 0
-  private var currentFileHostBuffers: Option[HostMemoryBuffersWithMetaDataBase] = None
+  protected var currentFileHostBuffers: Option[HostMemoryBuffersWithMetaDataBase] = None
   private var isInitted = false
   private val tasks = new ConcurrentLinkedQueue[Future[HostMemoryBuffersWithMetaDataBase]]()
   private val tasksToRun = new Queue[Callable[HostMemoryBuffersWithMetaDataBase]]()
@@ -129,7 +131,7 @@ abstract class MultiFileCloudPartitionReaderBase(
           }
         } else {
           isDone = true
-          metrics(PEAK_DEVICE_MEMORY) += 10000 //maxDeviceMemory
+          metrics(PEAK_DEVICE_MEMORY) += maxDeviceMemory
         }
       }
     }
