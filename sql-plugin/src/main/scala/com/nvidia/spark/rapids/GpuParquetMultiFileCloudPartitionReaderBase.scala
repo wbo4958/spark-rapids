@@ -52,8 +52,11 @@ abstract class MultiFileCloudPartitionReaderBase(
     files: Array[PartitionedFile],
     numThreads: Int,
     maxNumFileProcessed: Int,
-    filters: Array[Filter]) extends PartitionReader[ColumnarBatch] with Logging
+    filters: Array[Filter],
+    execMetrics: Map[String, GpuMetric]) extends PartitionReader[ColumnarBatch] with Logging
   with ScanWithMetrics with Arm {
+
+  metrics = execMetrics
 
   protected var batch: Option[ColumnarBatch] = None
   protected var isDone: Boolean = false

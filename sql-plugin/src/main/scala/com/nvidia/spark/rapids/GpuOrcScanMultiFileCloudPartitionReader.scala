@@ -1,18 +1,15 @@
 package com.nvidia.spark.rapids
 
-import java.io.{DataOutputStream, IOException}
-import java.net.URI
+import java.io.{DataOutputStream, File, IOException}
+import java.net.{URI, URISyntaxException}
 import java.nio.ByteBuffer
 import java.nio.channels.{Channels, WritableByteChannel}
 import java.util
 import java.util.concurrent.Callable
-
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 import scala.collection.mutable.{ArrayBuffer, Queue}
-
 import ai.rapids.cudf.{HostMemoryBuffer, NvtxColor, NvtxRange}
-
 import com.google.protobuf.CodedOutputStream
 import com.nvidia.spark.rapids.OrcUtilsNew.{OrcOutputStripeNew, OrcPartitionReaderContextNew}
 import com.nvidia.spark.rapids.RapidsPluginImplicits.AutoCloseableColumn
@@ -23,18 +20,23 @@ import org.apache.orc.{DataReader, OrcConf, OrcFile, OrcProto, PhysicalWriter, R
 import org.apache.orc.impl.{BufferChunk, DataReaderProperties, OrcCodecPool, OutStream, RecordReaderImpl, RecordReaderUtils, SchemaEvolution}
 import org.apache.orc.impl.RecordReaderImpl.SargApplier
 import org.apache.orc.mapred.OrcInputFormat
-
+import org.apache.spark.TaskContext
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
+import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, PartitionReaderFactory}
 import org.apache.spark.sql.execution.QueryExecutionException
-import org.apache.spark.sql.execution.datasources.PartitionedFile
+import org.apache.spark.sql.execution.datasources.v2.EmptyPartitionReader
+import org.apache.spark.sql.execution.datasources.{FilePartition, PartitionedFile}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.OrcFilters
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.SerializableConfiguration
+
+import scala.collection.immutable.HashSet
 
 
 
@@ -315,19 +317,20 @@ class GpuOrcPartitionReaderUtils(
 }
 
 private case class GpuOrcFileFilterHandler(
-    sqlConf: SQLConf,
+    @transient sqlConf: SQLConf,
     broadcastedConf: Broadcast[SerializableConfiguration],
     pushedFilters: Array[Filter]) extends Arm {
 
   val isCaseSensitive = sqlConf.caseSensitiveAnalysis
-  val conf = broadcastedConf.value.value
-  OrcConf.IS_SCHEMA_EVOLUTION_CASE_SENSITIVE.setBoolean(conf, isCaseSensitive)
 
   def filterStripes(
       partFile: PartitionedFile,
       dataSchema: StructType,
       readDataSchema: StructType,
       partitionSchema: StructType): OrcPartitionReaderContextNew = {
+
+    val conf = broadcastedConf.value.value
+    OrcConf.IS_SCHEMA_EVOLUTION_CASE_SENSITIVE.setBoolean(conf, isCaseSensitive)
 
     val filePath = new Path(new URI(partFile.filePath))
     val fs = filePath.getFileSystem(conf)
@@ -412,7 +415,6 @@ class MultiFileCloudOrcPartitionReader(
     conf: Configuration,
     files: Array[PartitionedFile],
     broadcastedConf: Broadcast[SerializableConfiguration],
-    isSchemaCaseSensitive: Boolean,
     dataSchema: StructType,
     readDataSchema: StructType,
     debugDumpPrefix: String,
@@ -422,11 +424,10 @@ class MultiFileCloudOrcPartitionReader(
     partitionSchema: StructType,
     numThreads: Int,
     maxNumFileProcessed: Int,
-    filterHandler: GpuParquetFileFilterHandler,
-    filters: Array[Filter])
-  extends MultiFileCloudPartitionReaderBase(conf, files, numThreads, maxNumFileProcessed, filters) {
-
-  private val handler = GpuOrcFileFilterHandler(sqlConf, broadcastedConf, filters)
+    filters: Array[Filter],
+    fileHandler: GpuOrcFileFilterHandler)
+  extends MultiFileCloudPartitionReaderBase(
+    conf, files, numThreads, maxNumFileProcessed, filters, execMetrics) {
 
   private class OrcReadBatchRunner(
       partFile: PartitionedFile,
@@ -449,14 +450,15 @@ class MultiFileCloudOrcPartitionReader(
 
       val hostBuffers = new ArrayBuffer[(HostMemoryBuffer, Long)]
       try {
-        val ctx = handler.filterStripes(partFile, dataSchema, readDataSchema, partitionSchema)
+        val ctx = fileHandler.filterStripes(partFile, dataSchema, readDataSchema, partitionSchema)
 
-        if (ctx.blockIterator.size == 0) {
-          val bytesRead = fileSystemBytesRead() - startingBytesRead
-          // no blocks so return null buffer and size 0
-          return HostMemoryBuffersForOrc(partFile.partitionValues, Array((null, 0)),
-            partFile.filePath, partFile.start, partFile.length, bytesRead)
-        }
+        // TODO need to fix this
+//        if (ctx.blockIterator.size == 0) {
+//          val bytesRead = fileSystemBytesRead() - startingBytesRead
+//          // no blocks so return null buffer and size 0
+//          return HostMemoryBuffersForOrc(partFile.partitionValues, Array((null, 0)),
+//            partFile.filePath, partFile.start, partFile.length, bytesRead)
+//        }
 
         blockChunkIter = ctx.blockIterator.buffered
 
@@ -709,4 +711,108 @@ class MultiFileCloudOrcPartitionReader(
 
     currentChunk
   }
+}
+
+case class GpuOrcMultiFilePartitionReaderFactory(
+  @transient sqlConf: SQLConf,
+  broadcastedConf: Broadcast[SerializableConfiguration],
+  dataSchema: StructType,
+  readDataSchema: StructType,
+  partitionSchema: StructType,
+  filters: Array[Filter],
+  @transient rapidsConf: RapidsConf,
+  metrics: Map[String, GpuMetric],
+  queryUsesInputFile: Boolean) extends PartitionReaderFactory with Arm with Logging {
+  private val isCaseSensitive = sqlConf.caseSensitiveAnalysis
+  private val debugDumpPrefix = rapidsConf.parquetDebugDumpPrefix
+  private val maxReadBatchSizeRows = rapidsConf.maxReadBatchSizeRows
+  private val maxReadBatchSizeBytes = rapidsConf.maxReadBatchSizeBytes
+  private val numThreads = rapidsConf.parquetMultiThreadReadNumThreads
+  private val maxNumFileProcessed = rapidsConf.maxNumParquetFilesParallel
+  private val canUseMultiThreadReader = rapidsConf.isParquetMultiThreadReadEnabled
+  // we can't use the coalescing files reader when InputFileName, InputFileBlockStart,
+  // or InputFileBlockLength because we are combining all the files into a single buffer
+  // and we don't know which file is associated with each row.
+  private val canUseCoalesceFilesReader =
+  rapidsConf.isParquetCoalesceFileReadEnabled && !queryUsesInputFile
+
+  private val configCloudSchemes = rapidsConf.getCloudSchemes
+  private val CLOUD_SCHEMES = HashSet("dbfs", "s3", "s3a", "s3n", "wasbs", "gs")
+  private val allCloudSchemes = CLOUD_SCHEMES ++ configCloudSchemes.getOrElse(Seq.empty)
+
+  private val filterHandler = GpuOrcFileFilterHandler(sqlConf, broadcastedConf, filters)
+
+  override def supportColumnarReads(partition: InputPartition): Boolean = true
+
+  override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
+    throw new IllegalStateException("GPU column parser called to read rows")
+  }
+
+  private def resolveURI(path: String): URI = {
+    try {
+      val uri = new URI(path)
+      if (uri.getScheme() != null) {
+        return uri
+      }
+    } catch {
+      case e: URISyntaxException =>
+    }
+    new File(path).getAbsoluteFile().toURI()
+  }
+
+  // We expect the filePath here to always have a scheme on it,
+  // if it doesn't we try using the local filesystem. If that
+  // doesn't work for some reason user would need to configure
+  // it directly.
+  private def isCloudFileSystem(filePath: String): Boolean = {
+    val uri = resolveURI(filePath)
+    val scheme = uri.getScheme
+    if (allCloudSchemes.contains(scheme)) {
+      true
+    } else {
+      false
+    }
+  }
+
+  private def arePathsInCloud(filePaths: Array[String]): Boolean = {
+    filePaths.exists(isCloudFileSystem)
+  }
+
+  override def createColumnarReader(partition: InputPartition): PartitionReader[ColumnarBatch] = {
+    assert(partition.isInstanceOf[FilePartition])
+    val filePartition = partition.asInstanceOf[FilePartition]
+    val files = filePartition.files
+    val filePaths = files.map(_.filePath)
+    val conf = broadcastedConf.value.value
+    buildBaseColumnarParquetReaderForCloud(files, conf)
+  }
+
+  private def buildBaseColumnarParquetReaderForCloud(
+    files: Array[PartitionedFile],
+    conf: Configuration): PartitionReader[ColumnarBatch] = {
+
+    val conf = broadcastedConf.value.value
+    OrcConf.IS_SCHEMA_EVOLUTION_CASE_SENSITIVE.setBoolean(conf, isCaseSensitive)
+
+    new MultiFileCloudOrcPartitionReader(sqlConf, conf, files, broadcastedConf,
+      dataSchema, readDataSchema, debugDumpPrefix, maxReadBatchSizeRows, maxReadBatchSizeBytes,
+      metrics, partitionSchema, numThreads, maxNumFileProcessed, filters, filterHandler)
+  }
+//
+//  private def buildBaseColumnarParquetReader(
+////    files: Array[PartitionedFile]): PartitionReader[ColumnarBatch] = {
+////    val conf = broadcastedConf.value.value
+////    val clippedBlocks = ArrayBuffer[ParquetFileInfoWithSingleBlockMeta]()
+////    files.map { file =>
+////      val singleFileInfo = filterHandler.filterBlocks(file, conf, filters, readDataSchema)
+////      clippedBlocks ++= singleFileInfo.blocks.map(
+////        ParquetFileInfoWithSingleBlockMeta(singleFileInfo.filePath, _, file.partitionValues,
+////          singleFileInfo.schema, singleFileInfo.isCorrectedRebaseMode))
+////    }
+//
+//    new MultiFileParquetPartitionReader(conf, files, clippedBlocks,
+//      isCaseSensitive, readDataSchema, debugDumpPrefix,
+//      maxReadBatchSizeRows, maxReadBatchSizeBytes, metrics,
+//      partitionSchema, numThreads)
+//  }
 }
