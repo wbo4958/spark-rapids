@@ -16,6 +16,7 @@ import org.apache.spark.sql.execution.datasources.PartitionedFile
 import org.apache.spark.sql.rapids.InputFileUtils
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
 import org.apache.spark.sql.sources.Filter
+import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 trait HostMemoryBuffersWithMetaDataBase {
@@ -47,6 +48,15 @@ case class HostMemoryBuffersForOrc(
   requestedMapping: Option[Array[Int]]
 ) extends HostMemoryBuffersWithMetaDataBase
 
+/**
+ * The Abstract base class working as multi-file cloud reading framework
+ * @param conf
+ * @param files PartitionFiles to be read
+ * @param numThreads the number of threads to parallelly read files.
+ * @param maxNumFileProcessed
+ * @param filters push down filters
+ * @param execMetrics
+ */
 abstract class MultiFileCloudPartitionReaderBase(
     conf: Configuration,
     files: Array[PartitionedFile],
@@ -89,16 +99,31 @@ abstract class MultiFileCloudPartitionReaderBase(
     filesToRead = files.length
   }
 
+  /**
+   * file reading logic which will be running in a thread pool
+   *
+   * @param file file to be read
+   * @param conf
+   * @param filters push down filters
+   * @return Callable[HostMemoryBuffersWithMetaDataBase]
+   */
   def getBatchRunner(
     file: PartitionedFile,
     conf: Configuration,
     filters: Array[Filter]): Callable[HostMemoryBuffersWithMetaDataBase]
 
+  /**
+   * decode HostMemoryBuffers by GPU
+   * @param fileBufsAndMeta
+   * @return
+   */
   def readBatch(
     fileBufsAndMeta: HostMemoryBuffersWithMetaDataBase): Option[ColumnarBatch]
 
+  def getLogTag: String
+
   override def next(): Boolean = {
-    withResource(new NvtxRange("Orc readBatch", NvtxColor.GREEN)) { _ =>
+    withResource(new NvtxRange(getLogTag + " readBatch", NvtxColor.GREEN)) { _ =>
       if (isInitted == false) {
         initAndStartReaders()
       }
@@ -192,6 +217,28 @@ abstract class MultiFileCloudPartitionReaderBase(
         // interrupt HDFS logs warnings about being interrupted.
         task.cancel(false)
       }
+    }
+  }
+
+  /**
+   * add Partititioned Columns
+   */
+  protected def addPartitionValues(
+    batch: Option[ColumnarBatch],
+    inPartitionValues: InternalRow,
+    partitionSchema: StructType): Option[ColumnarBatch] = {
+    if (partitionSchema.nonEmpty) {
+      batch.map { cb =>
+        val partitionValues = inPartitionValues.toSeq(partitionSchema)
+        val partitionScalars = ColumnarPartitionReaderWithPartitionValues
+          .createPartitionValues(partitionValues, partitionSchema)
+        withResource(partitionScalars) { scalars =>
+          ColumnarPartitionReaderWithPartitionValues.addPartitionValues(cb, scalars,
+            GpuColumnVector.extractTypes(partitionSchema))
+        }
+      }
+    } else {
+      batch
     }
   }
 

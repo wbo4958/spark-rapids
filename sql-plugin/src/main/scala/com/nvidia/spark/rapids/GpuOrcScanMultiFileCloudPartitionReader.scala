@@ -43,9 +43,6 @@ import java.util.Locale
 import scala.collection.immutable.HashSet
 import scala.math.max
 
-
-
-
 object OrcUtilsNew {
   case class OrcOutputStripeNew(
     infoBuilder: OrcProto.StripeInformation.Builder,
@@ -535,6 +532,8 @@ class MultiFileCloudOrcPartitionReader(
     }
   }
 
+  override def getLogTag: String = "Orc"
+
   private def readBufferToTable(buffer: HostMemoryBuffersForOrc): Option[ColumnarBatch] = {
     val memBuffersAndSize = buffer.memBuffersAndSizes
     val (hostBuffer, dataSize) = memBuffersAndSize.head
@@ -612,69 +611,6 @@ class MultiFileCloudOrcPartitionReader(
     }
   }
 
-  def readOrcToTable(buffer: HostMemoryBuffersForOrc): Option[Table] = {
-    val memBuffersAndSize = buffer.memBuffersAndSizes
-    val (dataBuffer, dataSize) = memBuffersAndSize.head
-    try {
-      if (dataSize == 0) {
-        None
-      } else {
-        if (debugDumpPrefix != null) {
-          //              dumpOrcData(dataBuffer, dataSize)
-        }
-        val fieldNames = buffer.updatedReadSchema.getFieldNames.asScala.toArray
-        val includedColumns = buffer.requestedMapping.map(
-          _.map(fieldNames(_))).getOrElse(fieldNames)
-        val parseOpts = ORCOptions.builder()
-          .withTimeUnit(DType.TIMESTAMP_MICROSECONDS)
-          .withNumPyTypes(false)
-          .includeColumn(includedColumns:_*)
-          .build()
-
-        // about to start using the GPU
-        GpuSemaphore.acquireIfNecessary(TaskContext.get())
-
-        val table = withResource(new NvtxWithMetrics("ORC decode", NvtxColor.DARK_GREEN,
-          metrics(GPU_DECODE_TIME))) { _ =>
-          Table.readORC(parseOpts, dataBuffer, 0, dataSize)
-        }
-        val batchSizeBytes = GpuColumnVector.getTotalDeviceMemoryUsed(table)
-        logDebug(s"GPU batch size: $batchSizeBytes bytes")
-        maxDeviceMemory = max(batchSizeBytes, maxDeviceMemory)
-        val numColumns = table.getNumberOfColumns
-        if (readDataSchema.length != numColumns) {
-          table.close()
-          throw new QueryExecutionException(s"Expected ${readDataSchema.length} columns " +
-            s"but read $numColumns from ${buffer.fileName}")
-        }
-        metrics(NUM_OUTPUT_BATCHES) += 1
-        Some(table)
-      }
-    } finally {
-      if (dataBuffer != null) {
-        dataBuffer.close()
-      }
-    }
-  }
-
-  protected def addPartitionValues(
-    batch: Option[ColumnarBatch],
-    inPartitionValues: InternalRow,
-    partitionSchema: StructType): Option[ColumnarBatch] = {
-    if (partitionSchema.nonEmpty) {
-      batch.map { cb =>
-        val partitionValues = inPartitionValues.toSeq(partitionSchema)
-        val partitionScalars = ColumnarPartitionReaderWithPartitionValues
-          .createPartitionValues(partitionValues, partitionSchema)
-        withResource(partitionScalars) { scalars =>
-          ColumnarPartitionReaderWithPartitionValues.addPartitionValues(cb, scalars,
-            GpuColumnVector.extractTypes(partitionSchema))
-        }
-      }
-    } else {
-      batch
-    }
-  }
 
 //  protected def evolveSchemaIfNeededAndClose(
 //    inputTable: Table,
