@@ -20,32 +20,15 @@ import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 trait HostMemoryBuffersWithMetaDataBase {
-  def partValues: InternalRow
+  def partitionedFile: PartitionedFile
   def memBuffersAndSizes: Array[(HostMemoryBuffer, Long)]
-  def fileName: String
-  def fileStart: Long
-  def fileLength: Long
   def bytesRead: Long
 }
 
 case class HostMemoryBuffersForParquet(
-  override val partValues: InternalRow,
+  override val partitionedFile: PartitionedFile,
   override val memBuffersAndSizes: Array[(HostMemoryBuffer, Long)],
-  override val fileName: String,
-  override val fileStart: Long,
-  override val fileLength: Long,
   override val bytesRead: Long
-) extends HostMemoryBuffersWithMetaDataBase
-
-case class HostMemoryBuffersForOrc(
-  override val partValues: InternalRow,
-  override val memBuffersAndSizes: Array[(HostMemoryBuffer, Long)],
-  override val fileName: String,
-  override val fileStart: Long,
-  override val fileLength: Long,
-  override val bytesRead: Long,
-  updatedReadSchema: TypeDescription,
-  requestedMapping: Option[Array[Int]]
 ) extends HostMemoryBuffersWithMetaDataBase
 
 /**
@@ -141,8 +124,10 @@ abstract class MultiFileCloudPartitionReaderBase(
           val fileBufsAndMeta = tasks.poll.get()
           filesToRead -= 1
           TrampolineUtil.incBytesRead(inputMetrics, fileBufsAndMeta.bytesRead)
-          InputFileUtils.setInputFileBlock(fileBufsAndMeta.fileName, fileBufsAndMeta.fileStart,
-            fileBufsAndMeta.fileLength)
+          InputFileUtils.setInputFileBlock(
+            fileBufsAndMeta.partitionedFile.filePath,
+            fileBufsAndMeta.partitionedFile.start,
+            fileBufsAndMeta.partitionedFile.length)
 
           if (getSizeOfHostBuffers(fileBufsAndMeta) == 0) {
             // if sizes are 0 means no rows and no data so skip to next file

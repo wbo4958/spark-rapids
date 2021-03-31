@@ -15,6 +15,7 @@ import com.nvidia.spark.RebaseHelper
 import com.nvidia.spark.rapids.GpuMetric.{GPU_DECODE_TIME, NUM_OUTPUT_BATCHES}
 import com.nvidia.spark.rapids.OrcUtilsNew.{OrcOutputStripeNew, OrcPartitionReaderContextNew}
 import com.nvidia.spark.rapids.RapidsPluginImplicits.AutoCloseableColumn
+import org.apache.commons.io.IOUtils
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.hadoop.hive.common.io.DiskRangeList
@@ -57,6 +58,14 @@ object OrcUtilsNew {
     blockIterator: Seq[OrcOutputStripeNew],
     requestedMapping: Option[Array[Int]])
 }
+
+case class HostMemoryBuffersForOrc(
+  override val partitionedFile: PartitionedFile,
+  override val memBuffersAndSizes: Array[(HostMemoryBuffer, Long)],
+  override val bytesRead: Long,
+  updatedReadSchema: TypeDescription,
+  requestedMapping: Option[Array[Int]]
+) extends HostMemoryBuffersWithMetaDataBase
 
 class GpuOrcPartitionReaderUtils(
     conf: Configuration,
@@ -457,8 +466,7 @@ class MultiFileCloudOrcPartitionReader(
         if (ctx.blockIterator.size == 0) {
           val bytesRead = fileSystemBytesRead() - startingBytesRead
           // no blocks so return null buffer and size 0
-          return HostMemoryBuffersForOrc(partFile.partitionValues, Array((null, 0)),
-            partFile.filePath, partFile.start, partFile.length, bytesRead,
+          return HostMemoryBuffersForOrc(partFile, Array((null, 0)), bytesRead,
             ctx.updatedReadSchema, ctx.requestedMapping)
         }
 
@@ -467,19 +475,16 @@ class MultiFileCloudOrcPartitionReader(
         if (isDone) {
           val bytesRead = fileSystemBytesRead() - startingBytesRead
           // got close before finishing
-          HostMemoryBuffersForOrc(partFile.partitionValues, Array((null, 0)),
-            partFile.filePath, partFile.start, partFile.length, bytesRead,
+          HostMemoryBuffersForOrc(partFile, Array((null, 0)), bytesRead,
             ctx.updatedReadSchema, ctx.requestedMapping)
         } else {
           if (readDataSchema.isEmpty) {
             val bytesRead = fileSystemBytesRead() - startingBytesRead
             val numRows = ctx.blockIterator.map(_.infoBuilder.getNumberOfRows).sum.toInt
             // overload size to be number of rows with null buffer
-            HostMemoryBuffersForOrc(partFile.partitionValues, Array((null, numRows)),
-              partFile.filePath, partFile.start, partFile.length, bytesRead,
+            HostMemoryBuffersForOrc(partFile, Array((null, numRows)), bytesRead,
               ctx.updatedReadSchema, ctx.requestedMapping)
           } else {
-            val filePath = new Path(new URI(partFile.filePath))
             while (blockChunkIter.hasNext) {
               val blocksToRead = populateCurrentBlockChunk(blockChunkIter)
               hostBuffers += readPartFile(ctx, blocksToRead)
@@ -488,15 +493,11 @@ class MultiFileCloudOrcPartitionReader(
             if (isDone) {
               // got close before finishing
               hostBuffers.foreach(_._1.safeClose())
-              HostMemoryBuffersForOrc(
-                partFile.partitionValues, Array((null, 0)), partFile.filePath,
-                partFile.start, partFile.length, bytesRead, ctx.updatedReadSchema,
-                ctx.requestedMapping)
+              HostMemoryBuffersForOrc(partFile, Array((null, 0)), bytesRead,
+                ctx.updatedReadSchema, ctx.requestedMapping)
             } else {
-              HostMemoryBuffersForOrc(
-                partFile.partitionValues, hostBuffers.toArray,
-                partFile.filePath, partFile.start,
-                partFile.length, bytesRead, ctx.updatedReadSchema, ctx.requestedMapping)
+              HostMemoryBuffersForOrc(partFile, hostBuffers.toArray, bytesRead,
+                ctx.updatedReadSchema, ctx.requestedMapping)
             }
           }
         }
@@ -534,6 +535,18 @@ class MultiFileCloudOrcPartitionReader(
 
   override def getLogTag: String = "Orc"
 
+  private def dumpOrcData(
+      hmb: HostMemoryBuffer, partFile: PartitionedFile, dataLength: Long): Unit = {
+    val (out, path) = FileUtils.createTempFile(conf, debugDumpPrefix, ".orc")
+    try {
+      logInfo(s"Writing ORC split data for $partFile to $path")
+      val in = new HostMemoryInputStream(hmb, dataLength)
+      IOUtils.copy(in, out)
+    } finally {
+      out.close()
+    }
+  }
+
   private def readBufferToTable(buffer: HostMemoryBuffersForOrc): Option[ColumnarBatch] = {
     val memBuffersAndSize = buffer.memBuffersAndSizes
     val (hostBuffer, dataSize) = memBuffersAndSize.head
@@ -547,13 +560,14 @@ class MultiFileCloudOrcPartitionReader(
       // Someone is going to process this data, even if it is just a row count
       GpuSemaphore.acquireIfNecessary(TaskContext.get())
       val emptyBatch = new ColumnarBatch(Array.empty, dataSize.toInt)
-      return addPartitionValues(Some(emptyBatch), buffer.partValues, partitionSchema)
+      return addPartitionValues(Some(emptyBatch), buffer.partitionedFile.partitionValues,
+        partitionSchema)
     }
 
     val table = withResource(hostBuffer) { _ =>
       if (debugDumpPrefix != null) {
         // TODO
-        // dumpOrcData(hostBuffer, dataSize)
+         dumpOrcData(hostBuffer, buffer.partitionedFile, dataSize)
       }
 
       val fieldNames = buffer.updatedReadSchema.getFieldNames.asScala.toArray
@@ -589,7 +603,7 @@ class MultiFileCloudOrcPartitionReader(
         val numColumns = table.getNumberOfColumns
         if (readDataSchema.length != numColumns) {
           throw new QueryExecutionException(s"Expected ${readDataSchema.length} columns " +
-            s"but read $numColumns from ${buffer.fileName}")
+            s"but read $numColumns from ${buffer.partitionedFile.filePath}")
         }
       }
       metrics(NUM_OUTPUT_BATCHES) += 1
@@ -605,7 +619,7 @@ class MultiFileCloudOrcPartitionReader(
       }
       // we have to add partition values here for this batch, we already verified that
       // its not different for all the blocks in this batch
-      addPartitionValues(maybeBatch, buffer.partValues, partitionSchema)
+      addPartitionValues(maybeBatch, buffer.partitionedFile.partitionValues, partitionSchema)
     } finally {
       table.foreach(_.close())
     }
@@ -873,17 +887,11 @@ case class GpuOrcMultiFilePartitionReaderFactory(
   metrics: Map[String, GpuMetric],
   queryUsesInputFile: Boolean) extends PartitionReaderFactory with Arm with Logging {
   private val isCaseSensitive = sqlConf.caseSensitiveAnalysis
-  private val debugDumpPrefix = rapidsConf.parquetDebugDumpPrefix
+  private val debugDumpPrefix = rapidsConf.orcDebugDumpPrefix
   private val maxReadBatchSizeRows = rapidsConf.maxReadBatchSizeRows
   private val maxReadBatchSizeBytes = rapidsConf.maxReadBatchSizeBytes
   private val numThreads = rapidsConf.parquetMultiThreadReadNumThreads
   private val maxNumFileProcessed = rapidsConf.maxNumParquetFilesParallel
-  private val canUseMultiThreadReader = rapidsConf.isParquetMultiThreadReadEnabled
-  // we can't use the coalescing files reader when InputFileName, InputFileBlockStart,
-  // or InputFileBlockLength because we are combining all the files into a single buffer
-  // and we don't know which file is associated with each row.
-  private val canUseCoalesceFilesReader =
-  rapidsConf.isParquetCoalesceFileReadEnabled && !queryUsesInputFile
 
   private val configCloudSchemes = rapidsConf.getCloudSchemes
   private val CLOUD_SCHEMES = HashSet("dbfs", "s3", "s3a", "s3n", "wasbs", "gs")
@@ -947,21 +955,5 @@ case class GpuOrcMultiFilePartitionReaderFactory(
       dataSchema, readDataSchema, debugDumpPrefix, maxReadBatchSizeRows, maxReadBatchSizeBytes,
       metrics, partitionSchema, numThreads, maxNumFileProcessed, filters, filterHandler)
   }
-//
-//  private def buildBaseColumnarParquetReader(
-////    files: Array[PartitionedFile]): PartitionReader[ColumnarBatch] = {
-////    val conf = broadcastedConf.value.value
-////    val clippedBlocks = ArrayBuffer[ParquetFileInfoWithSingleBlockMeta]()
-////    files.map { file =>
-////      val singleFileInfo = filterHandler.filterBlocks(file, conf, filters, readDataSchema)
-////      clippedBlocks ++= singleFileInfo.blocks.map(
-////        ParquetFileInfoWithSingleBlockMeta(singleFileInfo.filePath, _, file.partitionValues,
-////          singleFileInfo.schema, singleFileInfo.isCorrectedRebaseMode))
-////    }
-//
-//    new MultiFileParquetPartitionReader(conf, files, clippedBlocks,
-//      isCaseSensitive, readDataSchema, debugDumpPrefix,
-//      maxReadBatchSizeRows, maxReadBatchSizeBytes, metrics,
-//      partitionSchema, numThreads)
-//  }
+
 }
