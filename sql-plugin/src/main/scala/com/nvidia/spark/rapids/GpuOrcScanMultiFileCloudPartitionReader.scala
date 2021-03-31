@@ -57,7 +57,7 @@ object OrcUtilsNew {
     evolution: SchemaEvolution,
     dataReader: DataReader,
     orcReader: Reader,
-    blockIterator: BufferedIterator[OrcOutputStripeNew],
+    blockIterator: Seq[OrcOutputStripeNew],
     requestedMapping: Option[Array[Int]])
 }
 
@@ -91,7 +91,7 @@ class GpuOrcPartitionReaderUtils(
         sargApp, sargColumns, OrcConf.IGNORE_NON_UTF8_BLOOM_FILTERS.getBoolean(conf),
         orcReader.getWriterVersion)
       OrcPartitionReaderContextNew(updatedReadSchema, evolution, dataReader, orcReader,
-        stripes.iterator.buffered, requestedMapping)
+        stripes, requestedMapping)
     }
   }
 
@@ -457,15 +457,15 @@ class MultiFileCloudOrcPartitionReader(
       try {
         val ctx = fileHandler.filterStripes(partFile, dataSchema, readDataSchema, partitionSchema)
 
-        // TODO need to fix this
-//        if (ctx.blockIterator.size == 0) {
-//          val bytesRead = fileSystemBytesRead() - startingBytesRead
-//          // no blocks so return null buffer and size 0
-//          return HostMemoryBuffersForOrc(partFile.partitionValues, Array((null, 0)),
-//            partFile.filePath, partFile.start, partFile.length, bytesRead)
-//        }
+        if (ctx.blockIterator.size == 0) {
+          val bytesRead = fileSystemBytesRead() - startingBytesRead
+          // no blocks so return null buffer and size 0
+          return HostMemoryBuffersForOrc(partFile.partitionValues, Array((null, 0)),
+            partFile.filePath, partFile.start, partFile.length, bytesRead,
+            ctx.updatedReadSchema, ctx.requestedMapping)
+        }
 
-        blockChunkIter = ctx.blockIterator.buffered
+        blockChunkIter = ctx.blockIterator.iterator.buffered
 
         if (isDone) {
           val bytesRead = fileSystemBytesRead() - startingBytesRead
@@ -522,13 +522,93 @@ class MultiFileCloudOrcPartitionReader(
     fileBufsAndMeta: HostMemoryBuffersWithMetaDataBase): Option[ColumnarBatch] = {
     fileBufsAndMeta match {
       case buffer: HostMemoryBuffersForOrc =>
-        val table = readOrcToTable(buffer)
-        try {
-          table.map(GpuColumnVector.from(_, readDataSchema.toArray.map(_.dataType)))
-        } finally {
-          table.foreach(_.close())
+        val nextBatch = readBufferToTable(buffer)
+        val memBuffersAndSize = buffer.memBuffersAndSizes
+        if (memBuffersAndSize.length > 1) {
+          val updatedBuffers = memBuffersAndSize.drop(1)
+          currentFileHostBuffers = Some(buffer.copy(memBuffersAndSizes = updatedBuffers))
+        } else {
+          currentFileHostBuffers = None
         }
+        nextBatch
       case _ => throw new Exception("never reach here")
+    }
+  }
+
+  private def readBufferToTable(buffer: HostMemoryBuffersForOrc): Option[ColumnarBatch] = {
+    val memBuffersAndSize = buffer.memBuffersAndSizes
+    val (hostBuffer, dataSize) = memBuffersAndSize.head
+
+    if (dataSize == 0) {
+      // shouldn't ever get here
+      None
+    }
+    // not reading any data, but add in partition data if needed
+    if (hostBuffer == null) {
+      // Someone is going to process this data, even if it is just a row count
+      GpuSemaphore.acquireIfNecessary(TaskContext.get())
+      val emptyBatch = new ColumnarBatch(Array.empty, dataSize.toInt)
+      return addPartitionValues(Some(emptyBatch), buffer.partValues, partitionSchema)
+    }
+
+    val table = withResource(hostBuffer) { _ =>
+      if (debugDumpPrefix != null) {
+        // TODO
+        // dumpOrcData(hostBuffer, dataSize)
+      }
+
+      val fieldNames = buffer.updatedReadSchema.getFieldNames.asScala.toArray
+      val includedColumns = buffer.requestedMapping.map(
+        _.map(fieldNames(_))).getOrElse(fieldNames)
+      val parseOpts = ORCOptions.builder()
+        .withTimeUnit(DType.TIMESTAMP_MICROSECONDS)
+        .withNumPyTypes(false)
+        .includeColumn(includedColumns: _*)
+        .build()
+
+      // about to start using the GPU
+      GpuSemaphore.acquireIfNecessary(TaskContext.get())
+
+      val table = withResource(new NvtxWithMetrics("ORC decode", NvtxColor.DARK_GREEN,
+        metrics(GPU_DECODE_TIME))) { _ =>
+        Table.readORC(parseOpts, hostBuffer, 0, dataSize)
+      }
+
+      val batchSizeBytes = GpuColumnVector.getTotalDeviceMemoryUsed(table)
+      logDebug(s"GPU batch size: $batchSizeBytes bytes")
+      maxDeviceMemory = max(batchSizeBytes, maxDeviceMemory)
+
+      closeOnExcept(table) {_ =>
+        // TODO is there necessary to add rebase mode?
+//        if (!isCorrectRebaseMode) {
+//          (0 until table.getNumberOfColumns).foreach { i =>
+//            if (RebaseHelper.isDateTimeRebaseNeededRead(table.getColumn(i))) {
+//              throw RebaseHelper.newRebaseExceptionInRead("Parquet")
+//            }
+//          }
+//        }
+        val numColumns = table.getNumberOfColumns
+        if (readDataSchema.length != numColumns) {
+          throw new QueryExecutionException(s"Expected ${readDataSchema.length} columns " +
+            s"but read $numColumns from ${buffer.fileName}")
+        }
+      }
+      metrics(NUM_OUTPUT_BATCHES) += 1
+//      Some(evolveSchemaIfNeededAndClose(table, buffer.fileName,))
+      Some(table)
+    }
+
+    try {
+      val colTypes = readDataSchema.fields.map(f => f.dataType)
+      val maybeBatch = table.map(t => GpuColumnVector.from(t, colTypes))
+      maybeBatch.foreach { batch =>
+        logDebug(s"GPU batch size: ${GpuColumnVector.getTotalDeviceMemoryUsed(batch)} bytes")
+      }
+      // we have to add partition values here for this batch, we already verified that
+      // its not different for all the blocks in this batch
+      addPartitionValues(maybeBatch, buffer.partValues, partitionSchema)
+    } finally {
+      table.foreach(_.close())
     }
   }
 
@@ -595,71 +675,6 @@ class MultiFileCloudOrcPartitionReader(
       batch
     }
   }
-
-//  private def readBufferToTable(
-//    isCorrectRebaseMode: Boolean,
-//    clippedSchema: MessageType,
-//    partValues: InternalRow,
-//    hostBuffer: HostMemoryBuffer,
-//    dataSize: Long,
-//    fileName: String): Option[ColumnarBatch] = {
-//    if (dataSize == 0) {
-//      // shouldn't ever get here
-//      None
-//    }
-//    // not reading any data, but add in partition data if needed
-//    if (hostBuffer == null) {
-//      // Someone is going to process this data, even if it is just a row count
-//      GpuSemaphore.acquireIfNecessary(TaskContext.get())
-//      val emptyBatch = new ColumnarBatch(Array.empty, dataSize.toInt)
-//      return addPartitionValues(Some(emptyBatch), partValues, partitionSchema)
-//    }
-//    val table = withResource(hostBuffer) { _ =>
-//      if (debugDumpPrefix != null) {
-////        dumpParquetData(hostBuffer, dataSize, files)
-//      }
-//      val parseOpts = ParquetOptions.builder()
-//        .withTimeUnit(DType.TIMESTAMP_MICROSECONDS)
-//        .enableStrictDecimalType(true)
-//        .includeColumn(readDataSchema.fieldNames: _*).build()
-//
-//      // about to start using the GPU
-//      GpuSemaphore.acquireIfNecessary(TaskContext.get())
-//
-//      val table = withResource(new NvtxWithMetrics("Parquet decode", NvtxColor.DARK_GREEN,
-//        metrics(GPU_DECODE_TIME))) { _ =>
-//        Table.readParquet(parseOpts, hostBuffer, 0, dataSize)
-//      }
-//      closeOnExcept(table) { _ =>
-//        if (!isCorrectRebaseMode) {
-//          (0 until table.getNumberOfColumns).foreach { i =>
-//            if (RebaseHelper.isDateTimeRebaseNeededRead(table.getColumn(i))) {
-//              throw RebaseHelper.newRebaseExceptionInRead("Parquet")
-//            }
-//          }
-//        }
-//        maxDeviceMemory = max(GpuColumnVector.getTotalDeviceMemoryUsed(table), maxDeviceMemory)
-//        if (readDataSchema.length < table.getNumberOfColumns) {
-//          throw new QueryExecutionException(s"Expected ${readDataSchema.length} columns " +
-//            s"but read ${table.getNumberOfColumns} from $fileName")
-//        }
-//      }
-//      metrics(NUM_OUTPUT_BATCHES) += 1
-//      Some(evolveSchemaIfNeededAndClose(table, fileName, clippedSchema))
-//    }
-//    try {
-//      val colTypes = readDataSchema.fields.map(f => f.dataType)
-//      val maybeBatch = table.map(t => GpuColumnVector.from(t, colTypes))
-//      maybeBatch.foreach { batch =>
-//        logDebug(s"GPU batch size: ${GpuColumnVector.getTotalDeviceMemoryUsed(batch)} bytes")
-//      }
-//      // we have to add partition values here for this batch, we already verified that
-//      // its not different for all the blocks in this batch
-//      addPartitionValues(maybeBatch, partValues, partitionSchema)
-//    } finally {
-//      table.foreach(_.close())
-//    }
-//  }
 
 //  protected def evolveSchemaIfNeededAndClose(
 //    inputTable: Table,
