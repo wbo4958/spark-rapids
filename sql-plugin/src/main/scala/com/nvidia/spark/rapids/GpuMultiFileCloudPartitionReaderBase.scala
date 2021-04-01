@@ -83,7 +83,7 @@ abstract class MultiFileCloudPartitionReaderBase(
   }
 
   /**
-   * file reading logic which will be running in a thread pool
+   * file reading logic in a Callable which will be running in a thread pool
    *
    * @param file file to be read
    * @param conf
