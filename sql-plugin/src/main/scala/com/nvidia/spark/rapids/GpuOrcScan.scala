@@ -131,6 +131,7 @@ case class GpuOrcPartitionReaderFactory(
   private val debugDumpPrefix = rapidsConf.orcDebugDumpPrefix
   private val maxReadBatchSizeRows: Integer = rapidsConf.maxReadBatchSizeRows
   private val maxReadBatchSizeBytes: Long = rapidsConf.maxReadBatchSizeBytes
+  private val filterHandler = GpuOrcFileFilterHandler(sqlConf, broadcastedConf, pushedFilters)
 
   override def supportColumnarReads(partition: InputPartition): Boolean = true
 
@@ -141,37 +142,12 @@ case class GpuOrcPartitionReaderFactory(
   override def buildColumnarReader(partFile: PartitionedFile): PartitionReader[ColumnarBatch] = {
     val conf = broadcastedConf.value.value
     OrcConf.IS_SCHEMA_EVOLUTION_CASE_SENSITIVE.setBoolean(conf, isCaseSensitive)
+    val ctx = filterHandler.filterStripes(partFile, dataSchema, readDataSchema,
+      partitionSchema)
 
-    val filePath = new Path(new URI(partFile.filePath))
-    val fs = filePath.getFileSystem(conf)
-    val orcFileReaderOpts = OrcFile.readerOptions(conf).filesystem(fs)
-    closeOnExcept(OrcFile.createReader(filePath, orcFileReaderOpts)) { orcReader =>
-      val resultedColPruneInfo = GpuOrcPartitionReaderFactory.requestedColumnIds(
-        isCaseSensitive, dataSchema, readDataSchema, orcReader)
-      if (resultedColPruneInfo.isEmpty) {
-        orcReader.close()
-        new EmptyPartitionReader[ColumnarBatch]
-      } else {
-        val (requestedColIds, canPruneCols) = resultedColPruneInfo.get
-        GpuOrcPartitionReaderFactory.orcResultSchemaString(canPruneCols, dataSchema, readDataSchema,
-          partitionSchema, conf)
-        assert(requestedColIds.length == readDataSchema.length,
-          "[BUG] requested column IDs do not match required schema")
-        // Only need to filter ORC's schema evolution if it cannot prune directly
-        val requestedMapping = if (canPruneCols) {
-          None
-        } else {
-          Some(requestedColIds)
-        }
-        val fullSchema = StructType(dataSchema ++ partitionSchema)
-        val readerOpts = buildOrcReaderOpts(conf, orcReader, partFile, fullSchema)
-        val dataReader = buildDataReader(orcReader, readerOpts, filePath, fs, conf)
-        val reader = new PartitionReaderWithBytesRead(new GpuOrcPartitionReader(conf, partFile,
-          orcFileReaderOpts, orcReader, readerOpts, dataReader, readDataSchema, requestedMapping,
-          debugDumpPrefix, maxReadBatchSizeRows, maxReadBatchSizeBytes, metrics))
-        ColumnarPartitionReaderWithPartitionValues.newReader(partFile, reader, partitionSchema)
-      }
-    }
+    val reader = new PartitionReaderWithBytesRead(new GpuOrcPartitionReader(conf, partFile, ctx,
+      readDataSchema, debugDumpPrefix, maxReadBatchSizeRows, maxReadBatchSizeBytes, metrics))
+    ColumnarPartitionReaderWithPartitionValues.newReader(partFile, reader, partitionSchema)
   }
 
   private def buildOrcReaderOpts(
@@ -362,12 +338,7 @@ object GpuOrcPartitionReader {
  *
  * @param conf Hadoop configuration
  * @param partFile file split to read
- * @param orcFileReaderOpts file reader options
- * @param orcReader ORC reader instance
- * @param readerOpts reader options
- * @param dataReader ORC data reader instance
  * @param readDataSchema Spark schema of what will be read from the file
- * @param requestedMapping map of read schema field index to data schema index if no column names
  * @param debugDumpPrefix path prefix for dumping the memory file or null
  * @param maxReadBatchSizeRows maximum number of rows to read in a batch
  * @param maxReadBatchSizeBytes maximum number of bytes to read in a batch
@@ -376,12 +347,8 @@ object GpuOrcPartitionReader {
 class GpuOrcPartitionReader(
     conf: Configuration,
     partFile: PartitionedFile,
-    orcFileReaderOpts: OrcFile.ReaderOptions,
-    orcReader: Reader,
-    readerOpts: Reader.Options,
-    dataReader: DataReader,
+    ctx: OrcPartitionReaderContext,
     readDataSchema: StructType,
-    requestedMapping: Option[Array[Int]],
     debugDumpPrefix: String,
     maxReadBatchSizeRows: Integer,
     maxReadBatchSizeBytes: Long,
@@ -389,22 +356,12 @@ class GpuOrcPartitionReader(
     with ScanWithMetrics with Arm {
   private var batch: Option[ColumnarBatch] = None
   private var maxDeviceMemory: Long = 0
+  private var orcReader: Reader = ctx.orcReader // ORC reader instance
+  private var dataReader: DataReader = ctx.dataReader // ORC data reader instance
+  // map of read schema field index to data schema index if no column names
+  private var requestedMapping: Option[Array[Int]] = ctx.requestedMapping
 
   metrics = execMetrics
-
-  private val ctx = closeOnExcept(orcReader) { _ =>
-    val updatedReadSchema = checkSchemaCompatibility(orcReader.getSchema, readerOpts.getSchema,
-      readerOpts.getIsSchemaEvolutionCaseAware)
-    val evolution = new SchemaEvolution(orcReader.getSchema, readerOpts.getSchema, readerOpts)
-    val (sargApp, sargColumns) = getSearchApplier(evolution, orcFileReaderOpts.getUseUTCTimestamp)
-    val splitStripes = orcReader.getStripes.asScala.filter(s =>
-      s.getOffset >= partFile.start && s.getOffset < partFile.start + partFile.length)
-    val stripes = buildOutputStripes(splitStripes, evolution,
-      sargApp, sargColumns, OrcConf.IGNORE_NON_UTF8_BLOOM_FILTERS.getBoolean(conf),
-      orcReader.getWriterVersion)
-    OrcPartitionReaderContext(updatedReadSchema, evolution, dataReader, orcReader,
-      stripes.iterator.buffered)
-  }
 
   override def next(): Boolean = {
     batch.foreach(_.close())
@@ -449,163 +406,6 @@ class GpuOrcPartitionReader(
         }
       }
     }
-  }
-
-  /**
-   * Build an integer array that maps the original ORC file's column IDs
-   * to column IDs in the memory file. Columns that are not present in
-   * the memory file will have a mapping of -1.
-   *
-   * @param fileIncluded indicator per column in the ORC file whether it should be included
-   * @return column mapping array
-   */
-  private def columnRemap(fileIncluded: Array[Boolean]): Array[Int] = {
-    var nextOutputColumnId = 0
-    val result = new Array[Int](fileIncluded.length)
-    fileIncluded.indices.foreach { i =>
-      if (fileIncluded(i)) {
-        result(i) = nextOutputColumnId
-        nextOutputColumnId += 1
-      } else {
-        result(i) = -1
-      }
-    }
-    result
-  }
-
-  /**
-   * Compute an array of booleans, one for each column in the ORC file, indicating whether the
-   * corresponding ORC column ID should be included in the file to be loaded by the GPU.
-   *
-   * @param evolution ORC schema evolution instance
-   * @return per-column inclusion flags
-   */
-  private def calcOrcFileIncluded(evolution: SchemaEvolution): Array[Boolean] = {
-    if (requestedMapping.isDefined) {
-      // ORC schema has no column names, so need to filter based on index
-      val orcSchema = orcReader.getSchema
-      val topFields = orcSchema.getChildren
-      val numFlattenedCols = orcSchema.getMaximumId
-      val included = new Array[Boolean](numFlattenedCols + 1)
-      util.Arrays.fill(included, false)
-      // first column is the top-level schema struct, always add it
-      included(0) = true
-      // find each top-level column requested by top-level index and add it and all child columns
-      requestedMapping.get.foreach { colIdx =>
-        val field = topFields.get(colIdx)
-        (field.getId to field.getMaximumId).foreach { i =>
-          included(i) = true
-        }
-      }
-      included
-    } else {
-      evolution.getFileIncluded
-    }
-  }
-
-  /**
-   * Build the output stripe descriptors for what will appear in the ORC memory file.
-   *
-   * @param stripes descriptors for the ORC input stripes, filtered to what is in the split
-   * @param evolution ORC SchemaEvolution
-   * @param sargApp ORC search argument applier
-   * @param sargColumns mapping of ORC search argument columns
-   * @param ignoreNonUtf8BloomFilter true if bloom filters other than UTF8 should be ignored
-   * @param writerVersion writer version from the original ORC input file
-   * @return output stripes descriptors
-   */
-  private def buildOutputStripes(
-      stripes: Seq[StripeInformation],
-      evolution: SchemaEvolution,
-      sargApp: SargApplier,
-      sargColumns: Array[Boolean],
-      ignoreNonUtf8BloomFilter: Boolean,
-      writerVersion: OrcFile.WriterVersion): Seq[OrcOutputStripe] = {
-    val fileIncluded = calcOrcFileIncluded(evolution)
-    val columnMapping = columnRemap(fileIncluded)
-    val result = new ArrayBuffer[OrcOutputStripe](stripes.length)
-    stripes.foreach { stripe =>
-      val stripeFooter = dataReader.readStripeFooter(stripe)
-      val needStripe = if (sargApp != null) {
-        // An ORC schema is a single struct type describing the schema fields
-        val orcFileSchema = evolution.getFileType(0)
-        val orcIndex = dataReader.readRowIndex(stripe, orcFileSchema, stripeFooter,
-          ignoreNonUtf8BloomFilter, fileIncluded, null, sargColumns,
-          writerVersion, null, null)
-        val rowGroups = sargApp.pickRowGroups(stripe, orcIndex.getRowGroupIndex,
-          orcIndex.getBloomFilterKinds, stripeFooter.getColumnsList, orcIndex.getBloomFilterIndex,
-          true)
-        rowGroups != SargApplier.READ_NO_RGS
-      } else {
-        true
-      }
-
-      if (needStripe) {
-        result.append(buildOutputStripe(stripe, stripeFooter, columnMapping))
-      }
-    }
-
-    result
-  }
-
-  /**
-   * Build the output stripe descriptor for a corresponding input stripe
-   * that should be copied to the ORC memory file.
-   *
-   * @param inputStripe input stripe descriptor
-   * @param inputFooter input stripe footer
-   * @param columnMapping mapping of input column IDs to output column IDs
-   * @return output stripe descriptor
-   */
-  private def buildOutputStripe(
-      inputStripe: StripeInformation,
-      inputFooter: OrcProto.StripeFooter,
-      columnMapping: Array[Int]): OrcOutputStripe = {
-    val rangeCreator = new DiskRangeList.CreateHelper
-    val footerBuilder = OrcProto.StripeFooter.newBuilder()
-    var inputFileOffset = inputStripe.getOffset
-    var outputStripeDataLength = 0L
-
-    // copy stream descriptors for columns that are requested
-    inputFooter.getStreamsList.asScala.foreach { stream =>
-      val streamEndOffset = inputFileOffset + stream.getLength
-
-      if (stream.hasKind && stream.hasColumn) {
-        val outputColumn = columnMapping(stream.getColumn)
-        val wantKind = !GpuOrcPartitionReader.ORC_STREAM_KINDS_IGNORED.contains(stream.getKind)
-        if (outputColumn >= 0 && wantKind) {
-          // remap the column ID when copying the stream descriptor
-          footerBuilder.addStreams(OrcProto.Stream.newBuilder(stream).setColumn(outputColumn).build)
-          outputStripeDataLength += stream.getLength
-          rangeCreator.addOrMerge(inputFileOffset, streamEndOffset, true, true)
-        }
-      }
-
-      inputFileOffset = streamEndOffset
-    }
-
-    // add the column encodings that are relevant
-    for (i <- 0 until inputFooter.getColumnsCount) {
-      if (columnMapping(i) >= 0) {
-        footerBuilder.addColumns(inputFooter.getColumns(i))
-      }
-    }
-
-    // copy over the timezone
-    if (inputFooter.hasWriterTimezone) {
-      footerBuilder.setWriterTimezoneBytes(inputFooter.getWriterTimezoneBytes)
-    }
-
-    val outputStripeFooter = footerBuilder.build()
-
-    // Fill out everything for StripeInformation except the file offset and footer length
-    // which will be calculated when the stripe data is finally written.
-    val infoBuilder = OrcProto.StripeInformation.newBuilder()
-        .setIndexLength(0)
-        .setDataLength(outputStripeDataLength)
-        .setNumberOfRows(inputStripe.getNumberOfRows)
-
-    OrcOutputStripe(infoBuilder, outputStripeFooter, rangeCreator.get)
   }
 
   private def estimateOutputSize(stripes: Seq[OrcOutputStripe]): Long = {
@@ -735,74 +535,6 @@ class GpuOrcPartitionReader(
       readerSchema
     } else {
       ctx.evolution.getReaderSchema
-    }
-  }
-
-  /**
-   * Check if the read schema is compatible with the file schema.
-   *
-   * @param fileSchema input file's ORC schema
-   * @param readSchema ORC schema for what will be read
-   * @param isCaseAware true if field names are case-sensitive
-   * @return read schema mapped to the file's field names
-   */
-  private def checkSchemaCompatibility(
-      fileSchema: TypeDescription,
-      readSchema: TypeDescription,
-      isCaseAware: Boolean): TypeDescription = {
-    val fileFieldNames = fileSchema.getFieldNames.asScala
-    val fileChildren = fileSchema.getChildren.asScala
-    val caseSensitiveFileTypes = fileFieldNames.zip(fileChildren.zip(fileFieldNames)).toMap
-    val fileTypesMap = if (isCaseAware) {
-      caseSensitiveFileTypes
-    } else {
-      CaseInsensitiveMap[(TypeDescription, String)](caseSensitiveFileTypes)
-    }
-
-    val readerFieldNames = readSchema.getFieldNames.asScala
-    val readerChildren = readSchema.getChildren.asScala
-    val newReadSchema = TypeDescription.createStruct()
-    readerFieldNames.zip(readerChildren).foreach { case (readField, readType) =>
-      val (fileType, fileFieldName) = fileTypesMap.getOrElse(readField, (null, null))
-      if (readType != fileType) {
-        throw new QueryExecutionException("Incompatible schemas for ORC file" +
-            s" at ${partFile.filePath}\n" +
-            s" file schema: $fileSchema\n" +
-            s" read schema: $readSchema")
-      }
-      newReadSchema.addField(fileFieldName, fileType)
-    }
-
-    newReadSchema
-  }
-
-  /**
-   * Build an ORC search argument applier that can filter input file splits
-   * when predicate push-down filters have been specified.
-   *
-   * @param evolution ORC SchemaEvolution
-   * @param useUTCTimestamp true if timestamps are UTC
-   * @return the search argument applier and search argument column mapping
-   */
-  private def getSearchApplier(
-      evolution: SchemaEvolution,
-      useUTCTimestamp: Boolean): (SargApplier, Array[Boolean]) = {
-    val searchArg = readerOpts.getSearchArgument
-    if (searchArg != null && orcReader.getRowIndexStride != 0) {
-      val sa = new SargApplier(searchArg, orcReader.getRowIndexStride, evolution,
-        orcReader.getWriterVersion, useUTCTimestamp)
-      // SargApplier.sargColumns is unfortunately not visible so we redundantly compute it here.
-      val filterCols = RecordReaderImpl.mapSargColumnsToOrcInternalColIdx(searchArg.getLeaves,
-        evolution)
-      val saCols = new Array[Boolean](evolution.getFileIncluded.length)
-      filterCols.foreach { i =>
-        if (i > 0) {
-          saCols(i) = true
-        }
-      }
-      (sa, saCols)
-    } else {
-      (null, null)
     }
   }
 
@@ -1023,7 +755,6 @@ private case class GpuOrcFileFilterHandler(
       requestedMapping: Option[Array[Int]]) extends Arm {
 
     def getOrcPartitionReaderContext: OrcPartitionReaderContext = {
-
       closeOnExcept(orcReader) { _ =>
         val updatedReadSchema = checkSchemaCompatibility(orcReader.getSchema, readerOpts.getSchema,
           readerOpts.getIsSchemaEvolutionCaseAware)
@@ -1265,7 +996,6 @@ private case class GpuOrcFileFilterHandler(
 
       OrcOutputStripe(infoBuilder, outputStripeFooter, rangeCreator.get)
     }
-
   }
 
 }
