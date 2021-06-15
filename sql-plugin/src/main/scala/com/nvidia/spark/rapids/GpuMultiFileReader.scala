@@ -330,7 +330,6 @@ trait SingleDataBlockInfo {
 }
 
 abstract class MultiFileCoalescingPartitionReaderBase(
-    splits: Array[PartitionedFile],
     clippedBlocks: Seq[SingleDataBlockInfo],
     readDataSchema: StructType,
     partitionSchema: StructType,
