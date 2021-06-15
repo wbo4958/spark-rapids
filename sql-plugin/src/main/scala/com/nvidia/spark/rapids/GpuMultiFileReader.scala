@@ -372,12 +372,13 @@ abstract class MultiFileCoalescingPartitionReaderBase(
   // then allocate the corresponding host buffer to hold all the blocks
 
   /**
-   * Calculate the output size according to the block chunks
+   * Calculate the output size according to the block chunks and the schema
    * @param currentChunkedBlocks a sequence of data block to be evaluated
    * @param schema Schema info
    * @return Long, the estimated output size
    */
-  def calculateEstimatedOutputSize(currentChunkedBlocks: Seq[DataBlockBase],
+  def calculateEstimatedOutputSize(
+    currentChunkedBlocks: Seq[DataBlockBase],
     schema: SchemaBase): Long
 
   /**
@@ -487,9 +488,9 @@ abstract class MultiFileCoalescingPartitionReaderBase(
   }
 
   private def readToTable(
-    currentChunkedBlocks: Seq[(Path, DataBlockBase)],
-    clippedSchema: SchemaBase,
-    isCorrectRebaseMode: Boolean = false): Option[Table] = {
+      currentChunkedBlocks: Seq[(Path, DataBlockBase)],
+      clippedSchema: SchemaBase,
+      isCorrectRebaseMode: Boolean = false): Option[Table] = {
     if (currentChunkedBlocks.isEmpty) {
       return None
     }
@@ -516,6 +517,12 @@ abstract class MultiFileCoalescingPartitionReaderBase(
     }
   }
 
+  /**
+   * Read all data blocks into HostMemoryBuffer
+   * @param blocks a sequence of data blocks to be read
+   * @param clippedSchema the clipped schema is used to calculate the estimated output size
+   * @return (HostMemoryBuffer, Long), the HostMemoryBuffer and its data size
+   */
   private def readPartFiles(
       blocks: Seq[(Path, DataBlockBase)],
       clippedSchema: SchemaBase): (HostMemoryBuffer, Long) = {
@@ -533,12 +540,12 @@ abstract class MultiFileCoalescingPartitionReaderBase(
       val initTotalSize = calculateEstimatedOutputSize(allBlocks, clippedSchema)
 
       closeOnExcept(HostMemoryBuffer.allocate(initTotalSize)) { allocBuf =>
-        var hmb = allocBuf
+        val hmb = allocBuf
         val out = new HostMemoryOutputStream(hmb)
         var offset = out.getPos
         val allOutputBlocks = scala.collection.mutable.ArrayBuffer[DataBlockBase]()
         filesAndBlocks.foreach { case (file, blocks) =>
-          val fileBlockSize = blocks.flatMap(_.getFileBlockSize).sum
+          val fileBlockSize = blocks.map(_.getFileBlockSize).sum
           // use a single buffer and slice it up for different files if we need
           val outLocal = hmb.slice(offset, fileBlockSize)
           // copy the blocks for each file in parallel using background threads
@@ -560,11 +567,17 @@ abstract class MultiFileCoalescingPartitionReaderBase(
     }
   }
 
+  /**
+   * Populate block chunk with meta info according to maxReadBatchSizeRows
+   * and maxReadBatchSizeBytes
+   *
+   * @return [[CurrentChunkMeta]]
+   */
   private def populateCurrentBlockChunk(): CurrentChunkMeta = {
     val currentChunk = new ArrayBuffer[(Path, DataBlockBase)]
     var numRows: Long = 0
     var numBytes: Long = 0
-    var numParquetBytes: Long = 0
+    var numChunkBytes: Long = 0
     var currentFile: Path = null
     var currentPartitionValues: InternalRow = null
     var currentClippedSchema: SchemaBase = null
@@ -598,7 +611,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
           if (numBytes == 0 || numBytes + estimatedBytes <= maxReadBatchSizeBytes) {
             // only care to check if we are actually adding in the next chunk
             if (currentFile != blockIterator.head.filePath) {
-
+              // check if need to split next data block into another ColumnarBatch
               if (checkIfNeededToSplitDataBlock(currrentDataBlock, blockIterator.head)) {
                 logInfo(s"splitting ${blockIterator.head.filePath} into another batch!")
                 return
@@ -624,7 +637,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
             val nextTuple = (nextBlock.filePath, nextBlock.dataBlock)
             currentChunk += nextTuple
             numRows += currentChunk.last._2.getRowCount
-            numParquetBytes += currentChunk.last._2.getTotalByteSize
+            numChunkBytes += currentChunk.last._2.getTotalByteSize
             numBytes += estimatedBytes
             readNextBatch()
           }
@@ -633,8 +646,9 @@ abstract class MultiFileCoalescingPartitionReaderBase(
     }
     readNextBatch()
     rowsPerPartition += (numRows - lastPartRows)
-    logDebug(s"Loaded $numRows rows from Parquet. Parquet bytes read: $numParquetBytes. " +
-      s"Estimated GPU bytes: $numBytes. Number of different partitions: ${allPartValues.size}")
+    logDebug(s"Loaded $numRows rows from ${getFileFormatShortName}. " +
+      s"${getFileFormatShortName} bytes read: $numChunkBytes. Estimated GPU bytes: $numBytes. " +
+      s"Number of different partitions: ${allPartValues.size}")
     CurrentChunkMeta(currentIsCorrectRebaseMode, currentClippedSchema, currentChunk,
       numRows, rowsPerPartition.toArray, allPartValues.toArray)
   }
@@ -650,11 +664,11 @@ abstract class MultiFileCoalescingPartitionReaderBase(
    * @param partitionSchema - schema of the partitions
    * @return
    */
-  protected def addAllPartitionValues(
-    batch: Option[ColumnarBatch],
-    inPartitionValues: Array[InternalRow],
-    rowsPerPartition: Array[Long],
-    partitionSchema: StructType): Option[ColumnarBatch] = {
+  private def addAllPartitionValues(
+      batch: Option[ColumnarBatch],
+      inPartitionValues: Array[InternalRow],
+      rowsPerPartition: Array[Long],
+      partitionSchema: StructType): Option[ColumnarBatch] = {
     assert(rowsPerPartition.length == inPartitionValues.length)
     if (partitionSchema.nonEmpty) {
       batch.map { cb =>
@@ -672,9 +686,9 @@ abstract class MultiFileCoalescingPartitionReaderBase(
   }
 
   private def concatAndAddPartitionColsToBatch(
-    cb: ColumnarBatch,
-    rowsPerPartition: Array[Long],
-    inPartitionValues: Array[InternalRow]): ColumnarBatch = {
+      cb: ColumnarBatch,
+      rowsPerPartition: Array[Long],
+      inPartitionValues: Array[InternalRow]): ColumnarBatch = {
     withResource(cb) { _ =>
       closeOnExcept(buildAndConcatPartitionColumns(rowsPerPartition, inPartitionValues)) {
         allPartCols =>
@@ -684,8 +698,8 @@ abstract class MultiFileCoalescingPartitionReaderBase(
   }
 
   private def buildAndConcatPartitionColumns(
-    rowsPerPartition: Array[Long],
-    inPartitionValues: Array[InternalRow]): Array[GpuColumnVector] = {
+      rowsPerPartition: Array[Long],
+      inPartitionValues: Array[InternalRow]): Array[GpuColumnVector] = {
     val numCols = partitionSchema.fields.length
     val allPartCols = new Array[GpuColumnVector](numCols)
     // build the partitions vectors for all partitions within each column
