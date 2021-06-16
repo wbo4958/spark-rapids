@@ -26,6 +26,7 @@ import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 import scala.collection.immutable.HashSet
 import scala.collection.mutable.{ArrayBuffer, ArrayBuilder, LinkedHashMap}
+import scala.language.implicitConversions
 import scala.math.max
 
 import ai.rapids.cudf._
@@ -1585,7 +1586,7 @@ class MultiFileParquetPartitionReader1(
   }
 
   override def writeFileFooter(hmb: HostMemoryBuffer, initTotalSize: Long, offset: Long,
-      blocks: Seq[DataBlockBase], clippedSchema: SchemaBase): Unit = {
+      blocks: Seq[DataBlockBase], clippedSchema: SchemaBase): (HostMemoryBuffer, Long) = {
 
     // The footer size can change vs the initial estimated because we are combining more blocks
     //  and offsets are larger, check to make sure we allocated enough memory before writing.
@@ -1626,6 +1627,7 @@ class MultiFileParquetPartitionReader1(
           throw new QueryExecutionException(s"Calculated buffer size $totalBufferSize is to " +
             s"small, actual written: ${written}")
         }
+        written
       }
     }
 
