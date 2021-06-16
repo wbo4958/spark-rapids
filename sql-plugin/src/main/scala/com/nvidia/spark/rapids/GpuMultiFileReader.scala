@@ -506,24 +506,21 @@ abstract class MultiFileCoalescingPartitionReaderBase(
       return None
     }
     val (dataBuffer, dataSize, blocks) = readPartFiles(currentChunkedBlocks, clippedSchema)
-    try {
-      if (dataSize == 0) {
-        None
-      } else {
-        val table = readBufferToTable(dataBuffer, dataSize, blocks, clippedSchema,
-          isCorrectRebaseMode)
-        closeOnExcept(table) { _ =>
-          maxDeviceMemory = max(GpuColumnVector.getTotalDeviceMemoryUsed(table), maxDeviceMemory)
-          if (readDataSchema.length < table.getNumberOfColumns) {
-            throw new QueryExecutionException(s"Expected ${readDataSchema.length} columns " +
-              s"but read ${table.getNumberOfColumns} from $currentChunkedBlocks")
-          }
-        }
-        metrics(NUM_OUTPUT_BATCHES) += 1
-        Some(table)
-      }
-    } finally {
+    if (dataSize == 0) {
       dataBuffer.close()
+      None
+    } else {
+      val table = readBufferToTable(dataBuffer, dataSize, blocks, clippedSchema,
+        isCorrectRebaseMode)
+      closeOnExcept(table) { _ =>
+        maxDeviceMemory = max(GpuColumnVector.getTotalDeviceMemoryUsed(table), maxDeviceMemory)
+        if (readDataSchema.length < table.getNumberOfColumns) {
+          throw new QueryExecutionException(s"Expected ${readDataSchema.length} columns " +
+            s"but read ${table.getNumberOfColumns} from $currentChunkedBlocks")
+        }
+      }
+      metrics(NUM_OUTPUT_BATCHES) += 1
+      Some(table)
     }
   }
 

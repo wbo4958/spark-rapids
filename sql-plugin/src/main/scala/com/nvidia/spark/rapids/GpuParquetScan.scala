@@ -408,18 +408,37 @@ case class GpuParquetMultiFilePartitionReaderFactory(
   private def buildBaseColumnarParquetReader(
       files: Array[PartitionedFile]): PartitionReader[ColumnarBatch] = {
     val conf = broadcastedConf.value.value
-    val clippedBlocks = ArrayBuffer[ParquetFileInfoWithSingleBlockMeta]()
-    files.map { file =>
-      val singleFileInfo = filterHandler.filterBlocks(file, conf, filters, readDataSchema)
-      clippedBlocks ++= singleFileInfo.blocks.map(
-        ParquetFileInfoWithSingleBlockMeta(singleFileInfo.filePath, _, file.partitionValues,
-          singleFileInfo.schema, singleFileInfo.isCorrectedRebaseMode))
-    }
+    val newImpl = true
 
-    new MultiFileParquetPartitionReader(conf, files, clippedBlocks,
-      isCaseSensitive, readDataSchema, debugDumpPrefix,
-      maxReadBatchSizeRows, maxReadBatchSizeBytes, metrics,
-      partitionSchema, numThreads)
+    if (!newImpl) {
+      val clippedBlocks = ArrayBuffer[ParquetFileInfoWithSingleBlockMeta]()
+      files.map { file =>
+        val singleFileInfo = filterHandler.filterBlocks(file, conf, filters, readDataSchema)
+        clippedBlocks ++= singleFileInfo.blocks.map(
+          ParquetFileInfoWithSingleBlockMeta(singleFileInfo.filePath, _, file.partitionValues,
+            singleFileInfo.schema, singleFileInfo.isCorrectedRebaseMode))
+      }
+      new MultiFileParquetPartitionReader(conf, files, clippedBlocks,
+        isCaseSensitive, readDataSchema, debugDumpPrefix,
+        maxReadBatchSizeRows, maxReadBatchSizeBytes, metrics,
+        partitionSchema, numThreads)
+    } else {
+      val clippedBlocks = ArrayBuffer[ParquetSingleDataBlockMeta]()
+      files.map { file =>
+        val singleFileInfo = filterHandler.filterBlocks(file, conf, filters, readDataSchema)
+        clippedBlocks ++= singleFileInfo.blocks.map(block =>
+          ParquetSingleDataBlockMeta(
+            singleFileInfo.filePath,
+            ParquetDataBlock(block),
+            file.partitionValues,
+            ParquetSchemaWrapper(singleFileInfo.schema),
+            singleFileInfo.isCorrectedRebaseMode))
+      }
+      new MultiFileParquetPartitionReader1(conf, files, clippedBlocks,
+        isCaseSensitive, readDataSchema, debugDumpPrefix,
+        maxReadBatchSizeRows, maxReadBatchSizeBytes, metrics,
+        partitionSchema, numThreads)
+    }
   }
 }
 
@@ -1419,11 +1438,11 @@ class MultiFileParquetPartitionReader1(
   class ParquetCopyBlocksRunner1(
       file: Path,
       outhmb: HostMemoryBuffer,
-      blocks: ArrayBuffer[BlockMetaData],
+      blocks: ArrayBuffer[DataBlockBase],
       offset: Long)
-    extends Callable[(Seq[BlockMetaData], Long)] {
+    extends Callable[(Seq[DataBlockBase], Long)] {
 
-    override def call(): (Seq[BlockMetaData], Long) = {
+    override def call(): (Seq[DataBlockBase], Long) = {
       val startBytesRead = fileSystemBytesRead()
       val out = new HostMemoryOutputStream(outhmb)
       val res = withResource(file.getFileSystem(conf).open(file)) { in =>
@@ -1509,7 +1528,6 @@ class MultiFileParquetPartitionReader1(
       blocks: ArrayBuffer[DataBlockBase],
       offset: Long): Callable[(Seq[DataBlockBase], Long)] = {
     new ParquetCopyBlocksRunner1(file, outhmb, blocks, offset)
-      .asInstanceOf[Callable[(Seq[DataBlockBase], Long)]]
   }
 
   /**
