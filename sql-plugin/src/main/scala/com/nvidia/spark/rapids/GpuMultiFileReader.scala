@@ -428,12 +428,34 @@ abstract class MultiFileCoalescingPartitionReaderBase(
    * @param isCorrectRebaseMode specify if need to rebase
    * @return Table
    */
-  def readBufferToTable(
-    blocksBuffer: HostMemoryBuffer,
-    blockDataSize: Long,
-    blocks: Seq[DataBlockBase],
-    clippedSchema: SchemaBase,
-    isCorrectRebaseMode: Boolean): Table
+  def readBufferToTable(dataBuffer: HostMemoryBuffer, dataSize: Long,
+    isCorrectRebaseMode: Boolean, clippedSchema: SchemaBase): Table
+
+  /**
+   * Write a header for a specific file format. If there is no header for the file format,
+   * just ignore it and return 0
+   *
+   * @param buffer where the header will be written
+   * @return how many bytes written
+   */
+  def writeFileHeader(buffer: HostMemoryBuffer): Long
+
+  /**
+   * Writer a footer for a specific file format. If there is no footer for the file format,
+   * just return (hmb, offset)
+   *
+   * Please be note, some file format may re-allocate the HostMemoryBuffer because of the
+   * estimated initialized buffer size may be a little smaller than the actual size. So in
+   * this case, the hmb should be closed in the implementation.
+   *
+   * @param hmb            The buffer holding (header + data blocks)
+   * @param initTotalSize  The initialized buffer size
+   * @param offset         Where begin to write
+   * @param blocks         The data block meta info
+   * @param clippedSchema  The clipped schema info
+   */
+  def writeFileFooter(hmb: HostMemoryBuffer, initTotalSize: Long, offset: Long,
+    blocks: Seq[DataBlockBase], clippedSchema: SchemaBase): (HostMemoryBuffer, Long)
 
   override def get(): ColumnarBatch = {
     val ret = batch.getOrElse(throw new NoSuchElementException)
@@ -505,13 +527,12 @@ abstract class MultiFileCoalescingPartitionReaderBase(
     if (currentChunkedBlocks.isEmpty) {
       return None
     }
-    val (dataBuffer, dataSize, blocks) = readPartFiles(currentChunkedBlocks, clippedSchema)
+    val (dataBuffer, dataSize) = readPartFiles(currentChunkedBlocks, clippedSchema)
     if (dataSize == 0) {
       dataBuffer.close()
       None
     } else {
-      val table = readBufferToTable(dataBuffer, dataSize, blocks, clippedSchema,
-        isCorrectRebaseMode)
+      val table = readBufferToTable(dataBuffer, dataSize)
       closeOnExcept(table) { _ =>
         maxDeviceMemory = max(GpuColumnVector.getTotalDeviceMemoryUsed(table), maxDeviceMemory)
         if (readDataSchema.length < table.getNumberOfColumns) {
@@ -528,12 +549,12 @@ abstract class MultiFileCoalescingPartitionReaderBase(
    * Read all data blocks into HostMemoryBuffer
    * @param blocks a sequence of data blocks to be read
    * @param clippedSchema the clipped schema is used to calculate the estimated output size
-   * @return (HostMemoryBuffer, Long, Seq[DataBlockBase])
-   *         the HostMemoryBuffer and its data size and all the output blocks
+   * @return (HostMemoryBuffer, Long)
+   *         the HostMemoryBuffer and its data size
    */
   private def readPartFiles(
       blocks: Seq[(Path, DataBlockBase)],
-      clippedSchema: SchemaBase): (HostMemoryBuffer, Long, Seq[DataBlockBase]) = {
+      clippedSchema: SchemaBase): (HostMemoryBuffer, Long) = {
 
     withResource(new NvtxWithMetrics("Buffer file split", NvtxColor.YELLOW,
       metrics("bufferTime"))) { _ =>
@@ -546,19 +567,21 @@ abstract class MultiFileCoalescingPartitionReaderBase(
 
       val allBlocks = blocks.map(_._2)
 
+      // First, estimate the output file size for further allocating a buffer for it,
       val initTotalSize = calculateEstimatedBlocksOutputSize(allBlocks, clippedSchema)
 
       closeOnExcept(HostMemoryBuffer.allocate(initTotalSize)) { allocBuf =>
         val hmb = allocBuf
-        val out = new HostMemoryOutputStream(hmb)
-        var offset = out.getPos
+
+        // Second, write header
+        var offset = writeFileHeader(hmb)
+
         val allOutputBlocks = scala.collection.mutable.ArrayBuffer[DataBlockBase]()
         filesAndBlocks.foreach { case (file, blocks) =>
           val fileBlockSize = blocks.map(_.getFileBlockSize).sum
           // use a single buffer and slice it up for different files if we need
           val outLocal = hmb.slice(offset, fileBlockSize)
-          // copy the blocks for each file in parallel using background threads
-          // copy the blocks for each file in parallel using background threads
+          // Third, copy the blocks for each file in parallel using background threads
           tasks.add(getThreadPool(numThreads).submit(
             getBatchRunner(file, outLocal, blocks, offset)))
           offset += fileBlockSize
@@ -570,8 +593,8 @@ abstract class MultiFileCoalescingPartitionReaderBase(
           TrampolineUtil.incBytesRead(inputMetrics, bytesRead)
         }
 
-        out.close()
-        (hmb, offset, allOutputBlocks)
+        // Fourth,
+        writeFileFooter(hmb, initTotalSize, offset, allOutputBlocks, clippedSchema)
       }
     }
   }

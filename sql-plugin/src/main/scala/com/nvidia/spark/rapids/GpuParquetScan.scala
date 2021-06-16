@@ -1538,76 +1538,111 @@ class MultiFileParquetPartitionReader1(
    */
   override def getFileFormatShortName: String = "Parquet"
 
-  override def readBufferToTable(
-      blocksBuffer: HostMemoryBuffer,
-      blockDataSize: Long,
-      blocks: Seq[DataBlockBase],
-      clippedSchema: SchemaBase,
-      isCorrectRebaseMode: Boolean): Table = {
+  override def readBufferToTable(dataBuffer: HostMemoryBuffer, dataSize: Long,
+      isCorrectRebaseMode: Boolean, clippedSchema: SchemaBase): Table = {
 
-    val footerSize = calculateParquetFooterSize(blocks, clippedSchema)
-    // PARQUET_MAGIC(4) + RowGroups_size + FOOTER + FOOT_LENGTH(4) + PARQUET_MAGIC(4).
-    val bufferSize = 4 + blockDataSize + footerSize + 4 + 4
+    // Dump parquet data into a file
+    if (debugDumpPrefix != null) {
+      dumpParquetData(dataBuffer, dataSize, splits, debugDumpPrefix)
+    }
 
-    // Build PARQUET_MAGIC + ROW_GROUP(s)
-    withResource(HostMemoryBuffer.allocate(bufferSize)) { parquetBuffer =>
-      withResource(blocksBuffer) { _ =>
-        withResource(new HostMemoryInputStream(blocksBuffer, blockDataSize)) { in =>
-          withResource(new HostMemoryOutputStream(parquetBuffer)) { out =>
-            out.write(ParquetPartitionReader.PARQUET_MAGIC)
-            IOUtils.copy(in, out)
+    val parseOpts = ParquetOptions.builder()
+      .withTimeUnit(DType.TIMESTAMP_MICROSECONDS)
+      .enableStrictDecimalType(true)
+      .includeColumn(readDataSchema.fieldNames: _*).build()
+
+    // About to start using the GPU
+    GpuSemaphore.acquireIfNecessary(TaskContext.get())
+
+    val table = withResource(new NvtxWithMetrics(s"$getFileFormatShortName decode",
+      NvtxColor.DARK_GREEN, metrics(GPU_DECODE_TIME))) { _ =>
+      Table.readParquet(parseOpts, dataBuffer, 0, dataSize)
+    }
+
+    closeOnExcept(table) { _ =>
+      if (!isCorrectRebaseMode) {
+        (0 until table.getNumberOfColumns).foreach { i =>
+          if (RebaseHelper.isDateTimeRebaseNeededRead(table.getColumn(i))) {
+            throw RebaseHelper.newRebaseExceptionInRead("Parquet")
           }
         }
       }
+    }
+    evolveSchemaIfNeededAndClose(table, splits.mkString(","), clippedSchema)
+  }
 
-      val lenLeft = bufferSize - 4 - blockDataSize
-
-      // Build FOOTER + FOOTER_SIZE + PARQUET_MAGIC
-      withResource(parquetBuffer.slice(4 + blockDataSize, lenLeft)) { finalizehmb =>
-        withResource(new HostMemoryOutputStream(finalizehmb)) { footerOut =>
-          writeFooter(footerOut, blocks, clippedSchema)
-          BytesUtils.writeIntLittleEndian(footerOut, footerOut.getPos.toInt)
-          footerOut.write(ParquetPartitionReader.PARQUET_MAGIC)
-          val amountWritten = 4 + blockDataSize + footerOut.getPos
-          // check that we didn't go over memory
-          if (amountWritten > bufferSize) {
-            throw new QueryExecutionException(s"Calculated buffer size $bufferSize is to " +
-              s"small, actual written: ${amountWritten}")
-          }
-        }
-      }
-
-      // Dump parquet data into a file
-      if (debugDumpPrefix != null) {
-        dumpParquetData(parquetBuffer, bufferSize, splits, debugDumpPrefix)
-      }
-
-      val parseOpts = ParquetOptions.builder()
-        .withTimeUnit(DType.TIMESTAMP_MICROSECONDS)
-        .enableStrictDecimalType(true)
-        .includeColumn(readDataSchema.fieldNames:_*).build()
-
-      // About to start using the GPU
-      GpuSemaphore.acquireIfNecessary(TaskContext.get())
-
-      val table = withResource(new NvtxWithMetrics(s"$getFileFormatShortName decode",
-        NvtxColor.DARK_GREEN, metrics(GPU_DECODE_TIME))) { _ =>
-        Table.readParquet(parseOpts, parquetBuffer, 0, bufferSize)
-      }
-
-      closeOnExcept(table) { _ =>
-        if (!isCorrectRebaseMode) {
-          (0 until table.getNumberOfColumns).foreach { i =>
-            if (RebaseHelper.isDateTimeRebaseNeededRead(table.getColumn(i))) {
-              throw RebaseHelper.newRebaseExceptionInRead("Parquet")
-            }
-          }
-        }
-      }
-      evolveSchemaIfNeededAndClose(table, splits.mkString(","), clippedSchema)
+  /**
+   * Write a header for a specific file format
+   *
+   * @param buffer where the header will be written
+   * @return how many bytes written
+   */
+  override def writeFileHeader(buffer: HostMemoryBuffer): Long = {
+    withResource(new HostMemoryOutputStream(buffer)) { out =>
+      out.write(ParquetPartitionReader.PARQUET_MAGIC)
+      out.getPos
     }
   }
 
+  override def writeFileFooter(hmb: HostMemoryBuffer, initTotalSize: Long, offset: Long,
+      blocks: Seq[DataBlockBase], clippedSchema: SchemaBase): Unit = {
+
+    // The footer size can change vs the initial estimated because we are combining more blocks
+    //  and offsets are larger, check to make sure we allocated enough memory before writing.
+    // Not sure how expensive this is, we could throw exception instead if the written
+    // size comes out > then the estimated size.
+    val actualFooterSize = calculateParquetFooterSize(blocks, clippedSchema)
+    // 4 + 4 is for writing size and the ending PARQUET_MAGIC.
+    val bufferSizeReq = offset + actualFooterSize + 4 + 4
+
+    var buf: HostMemoryBuffer = hmb
+    val totalBufferSize = if (bufferSizeReq > initTotalSize) {
+      logWarning(s"The original estimated size $initTotalSize is to small, " +
+        s"reallocing and copying data to bigger buffer size: $bufferSizeReq")
+      // Close the old buffer
+      buf = withResource(hmb) { _ =>
+        withResource(new HostMemoryInputStream(hmb, offset)) { in =>
+          reallocHostBufferAndCopy(in, bufferSizeReq)
+        }
+      }
+      bufferSizeReq
+    } else {
+      initTotalSize
+    }
+
+    val lenLeft = totalBufferSize - offset
+
+    val amountWritten = closeOnExcept(buf) { _ =>
+      withResource(buf.slice(offset, lenLeft)) { finalizehmb =>
+        val written = withResource(new HostMemoryOutputStream(finalizehmb)) { footerOut =>
+          writeFooter(footerOut, blocks, clippedSchema)
+          BytesUtils.writeIntLittleEndian(footerOut, footerOut.getPos.toInt)
+          footerOut.write(ParquetPartitionReader.PARQUET_MAGIC)
+          offset + footerOut.getPos
+        }
+
+        // triple check we didn't go over memory
+        if (written > totalBufferSize) {
+          throw new QueryExecutionException(s"Calculated buffer size $totalBufferSize is to " +
+            s"small, actual written: ${written}")
+        }
+      }
+    }
+
+    (buf, amountWritten)
+  }
+
+  private def reallocHostBufferAndCopy(
+    in: HostMemoryInputStream,
+    newSizeEstimate: Long): HostMemoryBuffer = {
+    // realloc memory and copy
+    closeOnExcept(HostMemoryBuffer.allocate(newSizeEstimate)) { newhmb =>
+      val newout = new HostMemoryOutputStream(newhmb)
+      IOUtils.copy(in, newout)
+      newout.close()
+      newhmb
+    }
+  }
 }
 
 /**
