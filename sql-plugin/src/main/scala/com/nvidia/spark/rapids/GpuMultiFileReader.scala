@@ -317,19 +317,56 @@ trait DataBlockBase {
   def getFileBlockSize: Long
 }
 
-// A trait for schema
+//
+
+/**
+ * A common trait for different schema in the MultiFileCoalescingPartitionReaderBase.
+ *
+ * The sub-class should wrap the real schema for the specific file format
+ */
 trait SchemaBase
 
 // A single block info of a file
 // eg. a parquet file has 3 RowGroup, then it will produce 3 SingleBlockInfoWithMeta
+
+/**
+ * A single block info of a file,
+ *
+ * Eg, A parquet file has 3 RowGroup, then it will produce 3 SingleBlockInfoWithMeta
+ */
 trait SingleDataBlockInfo {
   def filePath: Path // file path info
   def partitionValues: InternalRow // partition value
   def dataBlock: DataBlockBase // a single block info of a single file
-  def isCorrectedRebaseMode: Boolean // TODO is this needed for ORC
+  def isCorrectedRebaseMode: Boolean // rebase mode
   def schema: SchemaBase // schema info
 }
 
+/**
+ * The abstracted multi-file coalescing reading class, which tries to coalesce small
+ * ColumnarBatches into a bigger ColumnarBatch according to maxReadBatchSizeRows,
+ * maxReadBatchSizeBytes and others.
+ *
+ * The whole data reading process will be typically benefit from bigger ColumnarBatch.
+ *
+ * The data driven:
+ *
+ * next() -> populateCurrentBlockChunk (try the best to coalesce ColumnarBatches)
+ *        -> allocate a bigger HostMemoryBuffer for the populated block chunks
+ *        -> writer header
+ *        -> launch threads (each thread for each block) to copy the blocks to the HostMemoryBuffer
+ *        -> writer footer
+ *        -> decode the HostMemoryBuffer in the GPU
+ *
+ * @param clippedBlocks         the block metadata from the original Parquet file that has been
+ *                                clipped to only contain the column chunks to be read
+ * @param readDataSchema        the Spark schema describing what will be read
+ * @param partitionSchema       Schema of partitions
+ * @param maxReadBatchSizeRows  soft limit on the maximum number of rows the reader reads per batch
+ * @param maxReadBatchSizeBytes soft limit on the maximum number of bytes the reader reads per batch
+ * @param numThreads            the size of the threadpool
+ * @param execMetrics           metrics
+ */
 abstract class MultiFileCoalescingPartitionReaderBase(
     clippedBlocks: Seq[SingleDataBlockInfo],
     readDataSchema: StructType,
@@ -359,6 +396,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
 
   /**
    * To check if the next block will be split into another ColumnarBatch
+   *
    * @param currentBlockInfo current SingleDataBlockInfo
    * @param nextBlockInfo    next SingleDataBlockInfo
    * @return Boolean
@@ -367,14 +405,12 @@ abstract class MultiFileCoalescingPartitionReaderBase(
     currentBlockInfo: SingleDataBlockInfo,
     nextBlockInfo: SingleDataBlockInfo): Boolean
 
-  // This method only calculate the total size according to the DataBlockBase not including
-  // any magic and footer.
-  // then allocate the corresponding host buffer to hold all the blocks
-
   /**
-   * Calculate the output size according to the block chunks and the schema
+   * Calculate the output size according to the block chunks and the schema, and the
+   * output size will be used as the initialized size of allocating HostMemoryBuffer
+   *
    * @param currentChunkedBlocks a sequence of data block to be evaluated
-   * @param schema Schema info
+   * @param schema               schema info
    * @return Long, the estimated output size
    */
   def calculateEstimatedBlocksOutputSize(
@@ -397,9 +433,10 @@ abstract class MultiFileCoalescingPartitionReaderBase(
    * which will be running in a thread pool
    *
    * @param file   file to be read
-   * @param outhmb
-   * @param blocks
-   * @param offset
+   * @param outhmb the sliced HostMemoryBuffer to hold the blocks,
+   *               which should be closed in sub-class
+   * @param blocks blocks meta info to specify which block to be copied
+   * @param offset used as the offset adjustment
    * @return Callable[(Seq[DataBlockBase], Long)]
    */
   def getBatchRunner(
@@ -421,11 +458,10 @@ abstract class MultiFileCoalescingPartitionReaderBase(
    *
    * Please be note, the dataBuffer only contains the data blocks, not including magic and footer
    *
-   * @param blocksBuffer  data block in Host Memory
-   * @param blockDataSize    data size
-   * @param blocks      all output data blocks
-   * @param clippedSchema the clipped schema
+   * @param dataBuffer  data block in Host Memory
+   * @param dataSize    data size
    * @param isCorrectRebaseMode specify if need to rebase
+   * @param clippedSchema the clipped schema
    * @return Table
    */
   def readBufferToTable(dataBuffer: HostMemoryBuffer, dataSize: Long,
@@ -444,7 +480,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
    * Writer a footer for a specific file format. If there is no footer for the file format,
    * just return (hmb, offset)
    *
-   * Please be note, some file format may re-allocate the HostMemoryBuffer because of the
+   * Please be note, some file formats may re-allocate the HostMemoryBuffer because of the
    * estimated initialized buffer size may be a little smaller than the actual size. So in
    * this case, the hmb should be closed in the implementation.
    *
@@ -453,6 +489,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
    * @param offset         Where begin to write
    * @param blocks         The data block meta info
    * @param clippedSchema  The clipped schema info
+   * @return the final HostMemoryBuffer and its size
    */
   def writeFileFooter(hmb: HostMemoryBuffer, initTotalSize: Long, offset: Long,
     blocks: Seq[DataBlockBase], clippedSchema: SchemaBase): (HostMemoryBuffer, Long)

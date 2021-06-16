@@ -1445,11 +1445,13 @@ class MultiFileParquetPartitionReader1(
 
     override def call(): (Seq[DataBlockBase], Long) = {
       val startBytesRead = fileSystemBytesRead()
-      val out = new HostMemoryOutputStream(outhmb)
-      val res = withResource(file.getFileSystem(conf).open(file)) { in =>
-        copyBlocksData(in, out, blocks, offset)
+      val res = withResource(outhmb) { _ =>
+        withResource(new HostMemoryOutputStream(outhmb)) { out =>
+          withResource(file.getFileSystem(conf).open(file)) { in =>
+            copyBlocksData(in, out, blocks, offset)
+          }
+        }
       }
-      outhmb.close()
       val bytesRead = fileSystemBytesRead() - startBytesRead
       (res, bytesRead)
     }
