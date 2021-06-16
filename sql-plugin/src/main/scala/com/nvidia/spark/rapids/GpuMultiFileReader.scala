@@ -313,11 +313,9 @@ trait DataBlockBase {
   def getRowCount: Long
   // uncompressed bytes
   def getTotalUnCompressedByteSize: Long
-  // TODO
+  // sum of all column size
   def getFileBlockSize: Long
 }
-
-//
 
 /**
  * A common trait for different schema in the MultiFileCoalescingPartitionReaderBase.
@@ -326,12 +324,8 @@ trait DataBlockBase {
  */
 trait SchemaBase
 
-// A single block info of a file
-// eg. a parquet file has 3 RowGroup, then it will produce 3 SingleBlockInfoWithMeta
-
 /**
  * A single block info of a file,
- *
  * Eg, A parquet file has 3 RowGroup, then it will produce 3 SingleBlockInfoWithMeta
  */
 trait SingleDataBlockInfo {

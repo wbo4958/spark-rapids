@@ -1367,7 +1367,10 @@ class MultiFileParquetPartitionReader(
   }
 }
 
+// Parquet schema wrapper
 case class ParquetSchemaWrapper(schema: MessageType) extends SchemaBase
+
+// Parquet BlockMetaData wrapper
 case class ParquetDataBlock(dataBlock: BlockMetaData) extends DataBlockBase {
   override def getRowCount: Long = dataBlock.getRowCount
   override def getTotalUnCompressedByteSize: Long = dataBlock.getTotalByteSize
