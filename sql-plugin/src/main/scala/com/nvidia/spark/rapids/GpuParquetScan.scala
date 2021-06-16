@@ -1469,7 +1469,7 @@ class MultiFileParquetPartitionReader1(
     if (nextBlockInfo.isCorrectedRebaseMode != currentBlockInfo.isCorrectedRebaseMode) {
       logInfo(s"datetime rebase mode for the next file ${nextBlockInfo.filePath} is " +
         s"different then current file ${currentBlockInfo.filePath}, splitting into another batch.")
-      return false
+      return true
     }
 
     val schemaNextFile =
@@ -1480,9 +1480,9 @@ class MultiFileParquetPartitionReader1(
     if (!schemaNextFile.sameElements(schemaCurrentfile)) {
       logInfo(s"File schema for the next file ${nextBlockInfo.filePath}" +
         s" doesn't match current ${currentBlockInfo.filePath}, splitting it into another batch!")
-      return false
+      return true
     }
-    true
+    false
   }
 
   /**
