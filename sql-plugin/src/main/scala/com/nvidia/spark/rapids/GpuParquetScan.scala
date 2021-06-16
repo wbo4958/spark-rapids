@@ -1385,11 +1385,11 @@ private case class ParquetSingleDataBlockMeta(
  * @param numThreads the size of the threadpool
  */
 class MultiFileParquetPartitionReader1(
-    conf: Configuration,
+    override val conf: Configuration,
     splits: Array[PartitionedFile],
     clippedBlocks: Seq[ParquetSingleDataBlockMeta],
-    isSchemaCaseSensitive: Boolean,
-    readDataSchema: StructType,
+    override val isSchemaCaseSensitive: Boolean,
+    override val readDataSchema: StructType,
     debugDumpPrefix: String,
     maxReadBatchSizeRows: Integer,
     maxReadBatchSizeBytes: Long,
@@ -1434,7 +1434,6 @@ class MultiFileParquetPartitionReader1(
       (res, bytesRead)
     }
   }
-
 
   /**
    * To check if the next block will be split into another ColumnarBatch
@@ -1560,6 +1559,7 @@ class MultiFileParquetPartitionReader1(
         }
       }
 
+      // Dump parquet data into a file
       if (debugDumpPrefix != null) {
         dumpParquetData(parquetBuffer, bufferSize, splits, debugDumpPrefix)
       }
@@ -1569,7 +1569,7 @@ class MultiFileParquetPartitionReader1(
         .enableStrictDecimalType(true)
         .includeColumn(readDataSchema.fieldNames:_*).build()
 
-      // about to start using the GPU
+      // About to start using the GPU
       GpuSemaphore.acquireIfNecessary(TaskContext.get())
 
       val table = withResource(new NvtxWithMetrics(s"$getFileFormatShortName decode",

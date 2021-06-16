@@ -510,7 +510,8 @@ abstract class MultiFileCoalescingPartitionReaderBase(
       if (dataSize == 0) {
         None
       } else {
-        val table = readBufferToTable(dataBuffer, dataSize, blocks, clippedSchema)
+        val table = readBufferToTable(dataBuffer, dataSize, blocks, clippedSchema,
+          isCorrectRebaseMode)
         closeOnExcept(table) { _ =>
           maxDeviceMemory = max(GpuColumnVector.getTotalDeviceMemoryUsed(table), maxDeviceMemory)
           if (readDataSchema.length < table.getNumberOfColumns) {
