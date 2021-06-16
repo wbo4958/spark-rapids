@@ -528,20 +528,21 @@ abstract class MultiFileCoalescingPartitionReaderBase(
       return None
     }
     val (dataBuffer, dataSize) = readPartFiles(currentChunkedBlocks, clippedSchema)
-    if (dataSize == 0) {
-      dataBuffer.close()
-      None
-    } else {
-      val table = readBufferToTable(dataBuffer, dataSize, isCorrectRebaseMode, clippedSchema)
-      closeOnExcept(table) { _ =>
-        maxDeviceMemory = max(GpuColumnVector.getTotalDeviceMemoryUsed(table), maxDeviceMemory)
-        if (readDataSchema.length < table.getNumberOfColumns) {
-          throw new QueryExecutionException(s"Expected ${readDataSchema.length} columns " +
-            s"but read ${table.getNumberOfColumns} from $currentChunkedBlocks")
+    withResource(dataBuffer) { _ =>
+      if (dataSize == 0) {
+        None
+      } else {
+        val table = readBufferToTable(dataBuffer, dataSize, isCorrectRebaseMode, clippedSchema)
+        closeOnExcept(table) { _ =>
+          maxDeviceMemory = max(GpuColumnVector.getTotalDeviceMemoryUsed(table), maxDeviceMemory)
+          if (readDataSchema.length < table.getNumberOfColumns) {
+            throw new QueryExecutionException(s"Expected ${readDataSchema.length} columns " +
+              s"but read ${table.getNumberOfColumns} from $currentChunkedBlocks")
+          }
         }
+        metrics(NUM_OUTPUT_BATCHES) += 1
+        Some(table)
       }
-      metrics(NUM_OUTPUT_BATCHES) += 1
-      Some(table)
     }
   }
 
@@ -557,7 +558,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
       clippedSchema: SchemaBase): (HostMemoryBuffer, Long) = {
 
     withResource(new NvtxWithMetrics("Buffer file split", NvtxColor.YELLOW,
-      metrics("bufferTime"))) { _ =>
+        metrics("bufferTime"))) { _ =>
       // ugly but we want to keep the order
       val filesAndBlocks = LinkedHashMap[Path, ArrayBuffer[DataBlockBase]]()
       blocks.foreach { case (path, block) =>
@@ -570,32 +571,31 @@ abstract class MultiFileCoalescingPartitionReaderBase(
       // First, estimate the output file size for further allocating a buffer for it,
       val initTotalSize = calculateEstimatedBlocksOutputSize(allBlocks, clippedSchema)
 
-      closeOnExcept(HostMemoryBuffer.allocate(initTotalSize)) { allocBuf =>
-        val hmb = allocBuf
+      val (buf, offset, outBlocks) = closeOnExcept(HostMemoryBuffer.allocate(initTotalSize)) {
+        hmb =>
+          // Second, write header
+          var offset = writeFileHeader(hmb)
 
-        // Second, write header
-        var offset = writeFileHeader(hmb)
+          val allOutputBlocks = scala.collection.mutable.ArrayBuffer[DataBlockBase]()
+          filesAndBlocks.foreach { case (file, blocks) =>
+            val fileBlockSize = blocks.map(_.getFileBlockSize).sum
+            // use a single buffer and slice it up for different files if we need
+            val outLocal = hmb.slice(offset, fileBlockSize)
+            // Third, copy the blocks for each file in parallel using background threads
+            tasks.add(getThreadPool(numThreads).submit(
+              getBatchRunner(file, outLocal, blocks, offset)))
+            offset += fileBlockSize
+          }
 
-        val allOutputBlocks = scala.collection.mutable.ArrayBuffer[DataBlockBase]()
-        filesAndBlocks.foreach { case (file, blocks) =>
-          val fileBlockSize = blocks.map(_.getFileBlockSize).sum
-          // use a single buffer and slice it up for different files if we need
-          val outLocal = hmb.slice(offset, fileBlockSize)
-          // Third, copy the blocks for each file in parallel using background threads
-          tasks.add(getThreadPool(numThreads).submit(
-            getBatchRunner(file, outLocal, blocks, offset)))
-          offset += fileBlockSize
-        }
-
-        for (future <- tasks.asScala) {
-          val (blocks, bytesRead) = future.get()
-          allOutputBlocks ++= blocks
-          TrampolineUtil.incBytesRead(inputMetrics, bytesRead)
-        }
-
-        // Fourth,
-        writeFileFooter(hmb, initTotalSize, offset, allOutputBlocks, clippedSchema)
+          for (future <- tasks.asScala) {
+            val (blocks, bytesRead) = future.get()
+            allOutputBlocks ++= blocks
+            TrampolineUtil.incBytesRead(inputMetrics, bytesRead)
+          }
+          (hmb, offset, allOutputBlocks)
       }
+      // Fourth,
+      writeFileFooter(buf, initTotalSize, offset, outBlocks, clippedSchema)
     }
   }
 

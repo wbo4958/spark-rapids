@@ -1494,10 +1494,7 @@ class MultiFileParquetPartitionReader1(
    */
   override def calculateEstimatedBlocksOutputSize(currentChunkedBlocks: Seq[DataBlockBase],
       schema: SchemaBase): Long = {
-    // Calculate the total amount of column data that will be copied
-    // NOTE: Avoid using block.getTotalByteSize here as that is the
-    //       uncompressed size rather than the size in the file.
-    currentChunkedBlocks.flatMap(_.getColumns.asScala.map(_.getTotalSize)).sum
+    calculateParquetOutputSize(currentChunkedBlocks, schema, true)
   }
 
   /**
@@ -1639,9 +1636,9 @@ class MultiFileParquetPartitionReader1(
     newSizeEstimate: Long): HostMemoryBuffer = {
     // realloc memory and copy
     closeOnExcept(HostMemoryBuffer.allocate(newSizeEstimate)) { newhmb =>
-      val newout = new HostMemoryOutputStream(newhmb)
-      IOUtils.copy(in, newout)
-      newout.close()
+      withResource(new HostMemoryOutputStream(newhmb)) { out =>
+        IOUtils.copy(in, out)
+      }
       newhmb
     }
   }
