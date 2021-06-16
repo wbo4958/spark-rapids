@@ -23,11 +23,12 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable.{ArrayBuffer, LinkedHashMap, Queue}
 import scala.math.max
 
-import ai.rapids.cudf.{ColumnVector, DType, HostMemoryBuffer, NvtxColor, NvtxRange, ParquetOptions, Table}
+import ai.rapids.cudf.{ColumnVector, HostMemoryBuffer, NvtxColor, NvtxRange, Table}
 import com.google.common.util.concurrent.ThreadFactoryBuilder
-import com.nvidia.spark.rapids.GpuMetric.{GPU_DECODE_TIME, NUM_OUTPUT_BATCHES, PEAK_DEVICE_MEMORY}
+import com.nvidia.spark.rapids.GpuMetric.{NUM_OUTPUT_BATCHES, PEAK_DEVICE_MEMORY}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.parquet.hadoop.metadata.BlockMetaData
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
@@ -311,7 +312,7 @@ trait DataBlockBase {
   // get the row number of this data block
   def getRowCount: Long
   // uncompressed bytes
-  def getTotalByteSize: Long
+  def getTotalUnCompressedByteSize: Long
   // TODO
   def getFileBlockSize: Long
 }
@@ -376,7 +377,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
    * @param schema Schema info
    * @return Long, the estimated output size
    */
-  def calculateEstimatedOutputSize(
+  def calculateEstimatedBlocksOutputSize(
     currentChunkedBlocks: Seq[DataBlockBase],
     schema: SchemaBase): Long
 
@@ -417,11 +418,22 @@ abstract class MultiFileCoalescingPartitionReaderBase(
 
   /**
    * Sent host memory to GPU to decode
-   * @param dataBuffer  data in Host Memory
-   * @param dataSize    data size
+   *
+   * Please be note, the dataBuffer only contains the data blocks, not including magic and footer
+   *
+   * @param blocksBuffer  data block in Host Memory
+   * @param blockDataSize    data size
+   * @param blocks      all output data blocks
+   * @param clippedSchema the clipped schema
+   * @param isCorrectRebaseMode specify if need to rebase
    * @return Table
    */
-  def readBufferToTable(dataBuffer: HostMemoryBuffer, dataSize: Long): Table
+  def readBufferToTable(
+    blocksBuffer: HostMemoryBuffer,
+    blockDataSize: Long,
+    blocks: Seq[DataBlockBase],
+    clippedSchema: SchemaBase,
+    isCorrectRebaseMode: Boolean): Table
 
   override def get(): ColumnarBatch = {
     val ret = batch.getOrElse(throw new NoSuchElementException)
@@ -493,14 +505,12 @@ abstract class MultiFileCoalescingPartitionReaderBase(
     if (currentChunkedBlocks.isEmpty) {
       return None
     }
-    val (dataBuffer, dataSize) = readPartFiles(currentChunkedBlocks, clippedSchema)
+    val (dataBuffer, dataSize, blocks) = readPartFiles(currentChunkedBlocks, clippedSchema)
     try {
       if (dataSize == 0) {
         None
       } else {
-
-        val table = readBufferToTable(dataBuffer, dataSize)
-
+        val table = readBufferToTable(dataBuffer, dataSize, blocks, clippedSchema)
         closeOnExcept(table) { _ =>
           maxDeviceMemory = max(GpuColumnVector.getTotalDeviceMemoryUsed(table), maxDeviceMemory)
           if (readDataSchema.length < table.getNumberOfColumns) {
@@ -520,11 +530,13 @@ abstract class MultiFileCoalescingPartitionReaderBase(
    * Read all data blocks into HostMemoryBuffer
    * @param blocks a sequence of data blocks to be read
    * @param clippedSchema the clipped schema is used to calculate the estimated output size
-   * @return (HostMemoryBuffer, Long), the HostMemoryBuffer and its data size
+   * @return (HostMemoryBuffer, Long, Seq[DataBlockBase])
+   *         the HostMemoryBuffer and its data size and all the output blocks
    */
   private def readPartFiles(
       blocks: Seq[(Path, DataBlockBase)],
-      clippedSchema: SchemaBase): (HostMemoryBuffer, Long) = {
+      clippedSchema: SchemaBase): (HostMemoryBuffer, Long, Seq[DataBlockBase]) = {
+
     withResource(new NvtxWithMetrics("Buffer file split", NvtxColor.YELLOW,
       metrics("bufferTime"))) { _ =>
       // ugly but we want to keep the order
@@ -536,7 +548,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
 
       val allBlocks = blocks.map(_._2)
 
-      val initTotalSize = calculateEstimatedOutputSize(allBlocks, clippedSchema)
+      val initTotalSize = calculateEstimatedBlocksOutputSize(allBlocks, clippedSchema)
 
       closeOnExcept(HostMemoryBuffer.allocate(initTotalSize)) { allocBuf =>
         val hmb = allocBuf
@@ -561,7 +573,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
         }
 
         out.close()
-        (hmb, offset)
+        (hmb, offset, allOutputBlocks)
       }
     }
   }
@@ -636,7 +648,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
             val nextTuple = (nextBlock.filePath, nextBlock.dataBlock)
             currentChunk += nextTuple
             numRows += currentChunk.last._2.getRowCount
-            numChunkBytes += currentChunk.last._2.getTotalByteSize
+            numChunkBytes += currentChunk.last._2.getTotalUnCompressedByteSize
             numBytes += estimatedBytes
             readNextBatch()
           }
